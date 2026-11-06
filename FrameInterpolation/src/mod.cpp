@@ -10,7 +10,6 @@
 #include <unordered_set>
 #include <memory>
 #include <array>
-#include <bitset>
 #include <tuple>
 #include "api.h"
 #include "game_code.h"
@@ -116,20 +115,8 @@ CreateBufferFn oldCreateVB=nullptr,oldCreateIB=nullptr;
 HRESULT __stdcall CreateVB(void* d,UINT n,DWORD usage,DWORD fvf,D3DPOOL pool,void** out){HRESULT hr=oldCreateVB(d,n,usage,fvf,pool,out);if(SUCCEEDED(hr)&&out)TrackBuffer(*out,n,(usage&D3DUSAGE_DYNAMIC)!=0);return hr;}
 HRESULT __stdcall CreateIB(void* d,UINT n,DWORD usage,DWORD format,D3DPOOL pool,void** out){HRESULT hr=oldCreateIB(d,n,usage,format,pool,out);if(SUCCEEDED(hr)&&out)TrackBuffer(*out,n);return hr;}
 
-// GPU-resident copy of unchanged buffer geometry. Each interpolated image
-// otherwise re-sends every vertex through DrawPrimitiveUP. Contents are an
-// exact copy of one command's data and are only used for identical bytes.
-size_t geometryBytes=0;
-struct Geometry {
-    void* vb=nullptr;void* ib=nullptr;std::vector<uint8_t> data,indices;DWORD fvf=0;UINT stride=0;D3DFORMAT indexFormat=D3DFMT_INDEX16;uint64_t used=0;
-    Geometry()=default;Geometry(const Geometry&)=delete;Geometry& operator=(const Geometry&)=delete;
-    ~Geometry(){geometryBytes-=data.size()+indices.size();if(shuttingDown)return;Release(vb);Release(ib);}
-};
-std::unordered_multimap<uint64_t,std::shared_ptr<Geometry>> geometryCache;
-std::unordered_map<uint64_t,uint64_t> geometrySeen,geometrySeenBefore;uint64_t geometryTick=0;
 struct Command {
     enum Kind {Draw,Clear,Copy} kind=Draw;
-    bool fromBuffer=false;std::shared_ptr<Geometry> geometry;
     pipeline::State gpu;void* dev=nullptr;void* target=nullptr;void* depth=nullptr;void* source=nullptr;
     D3DVIEWPORT9 viewport{};Matrix world{},view{},projection{};
     DWORD fvf=0;UINT stride=0,count=0,vertices=0;D3DPRIMITIVETYPE primitive=D3DPT_TRIANGLELIST;
@@ -139,7 +126,7 @@ struct Command {
     uint64_t key=0,layout=0,layoutKey=0;uintptr_t texture=0;std::array<uintptr_t,8> textures{};uintptr_t targetOwner=0,sourceOwner=0;bool scene3d=false,skinned=false,screenSpace=false,canvas=false;
     void Reuse(){
         Release(target);Release(depth);Release(source);for(auto t:gpu.textures)Release(t);gpu.textures.fill(nullptr);target=depth=source=nullptr;
-        kind=Draw;fromBuffer=false;geometry.reset();viewport={};world=view=projection={};fvf=0;stride=count=vertices=0;primitive=D3DPT_TRIANGLELIST;
+        kind=Draw;viewport={};world=view=projection={};fvf=0;stride=count=vertices=0;primitive=D3DPT_TRIANGLELIST;
         data.clear();indices.clear();indexFormat=D3DFMT_INDEX16;clearRects.clear();copyRects.clear();points.clear();flags=color=stencil=0;z=1;
         key=layout=layoutKey=0;texture=targetOwner=sourceOwner=0;textures={};scene3d=skinned=screenSpace=canvas=false;
     }
@@ -161,7 +148,7 @@ const Command* PriorLayout(uint64_t key){
 std::vector<std::unique_ptr<Command>> commandPool;size_t pooledBytes=0;
 size_t Storage(const Command& c){return c.data.capacity()+c.indices.capacity()+c.gpu.lights.capacity()*sizeof(pipeline::Light)+sizeof(Command);}
 std::unique_ptr<Command> Acquire(){if(commandPool.empty())return std::make_unique<Command>();auto c=std::move(commandPool.back());commandPool.pop_back();pooledBytes-=Storage(*c);c->Reuse();return c;}
-void Recycle(Frame& f){timing::Scope timer(timing::Cleanup);if(&f==&previous)layoutHistory.clear();for(auto& c:f.commands){c->geometry.reset();size_t n=Storage(*c);if(commandPool.size()<2048&&n<=FrameBudget-pooledBytes){pooledBytes+=n;commandPool.push_back(std::move(c));}}f=Frame{};}
+void Recycle(Frame& f){timing::Scope timer(timing::Cleanup);if(&f==&previous)layoutHistory.clear();for(auto& c:f.commands){size_t n=Storage(*c);if(commandPool.size()<2048&&n<=FrameBudget-pooledBytes){pooledBytes+=n;commandPool.push_back(std::move(c));}}f=Frame{};}
 std::unordered_set<void*> texturesRead;
 void Invalidate(Status why,uint32_t reason=timing::GeometryRejected){FlushDeferred();timing::frame.reasons|=timing::Unsupported|reason;capturing=false;current.valid=false;counters.status=why;}
 void PixelShaderDeleted(DWORD shader){
@@ -170,7 +157,7 @@ void PixelShaderDeleted(DWORD shader){
     if(uses(current))Invalidate(Unsupported,timing::StateRejected);
     pipeline::dirty=true;
 }
-void ClearHistory(){FlushDeferred();deferCandidate=false;timing::Scope timer(timing::Cleanup);layoutHistory.clear();current=Frame{};previous=Frame{};commandPool.clear();pooledBytes=0;texturesRead.clear();geometryCache.clear();geometrySeen.clear();geometrySeenBefore.clear();if(restoreToken&&device){D8<56>(device,restoreToken);restoreToken=0;}pipeline::dirty=true;++epoch;warmup=3;}
+void ClearHistory(){FlushDeferred();deferCandidate=false;timing::Scope timer(timing::Cleanup);layoutHistory.clear();current=Frame{};previous=Frame{};commandPool.clear();pooledBytes=0;texturesRead.clear();if(restoreToken&&device){D8<56>(device,restoreToken);restoreToken=0;}pipeline::dirty=true;++epoch;warmup=3;}
 using TextureLockFn=HRESULT(__stdcall*)(void*,UINT,D3DLOCKED_RECT*,const RECT*,DWORD);
 std::unordered_map<void**,TextureLockFn> textureLocks;
 HRESULT __stdcall TextureLock(void* texture,UINT level,D3DLOCKED_RECT* data,const RECT* rect,DWORD flags){
@@ -212,17 +199,8 @@ bool State(Command& c){
     c.skinned=skinOwner!=0;return true;
 }
 template<class Index> bool RebaseIndices(std::vector<uint8_t>& data,UINT min,UINT vertices){
-    if(data.size()%sizeof(Index))return false;size_t i=0;
-    if constexpr(sizeof(Index)==2){
-        // Eight 16-bit indices per step. With min+vertices<=65536 an index below
-        // min wraps to >=vertices, so one unsigned bound check covers both ends.
-        if(vertices&&uint64_t(min)+vertices<=65536){
-            const __m128i base=_mm_set1_epi16(short(min)),last=_mm_set1_epi16(short(vertices-1)),zero=_mm_setzero_si128();
-            for(;i+16<=data.size();i+=16){auto p=reinterpret_cast<__m128i*>(data.data()+i);const __m128i v=_mm_sub_epi16(_mm_loadu_si128(p),base);
-                if(_mm_movemask_epi8(_mm_cmpeq_epi16(_mm_subs_epu16(v,last),zero))!=0xffff)return false;_mm_storeu_si128(p,v);}
-        }
-    }
-    for(;i<data.size();i+=sizeof(Index)){Index raw;memcpy(&raw,data.data()+i,sizeof(raw));uint32_t value=raw;
+    if(data.size()%sizeof(Index))return false;
+    for(size_t i=0;i<data.size();i+=sizeof(Index)){Index raw;memcpy(&raw,data.data()+i,sizeof(raw));uint32_t value=raw;
         if(value<min||value-min>=vertices)return false;raw=Index(value-min);memcpy(data.data()+i,&raw,sizeof(raw));}
     return true;
 }
@@ -230,11 +208,10 @@ template<class Index> bool IndicesInRange(const std::vector<uint8_t>& data,UINT 
     if(data.size()%sizeof(Index))return false;
     for(size_t i=0;i<data.size();i+=sizeof(Index)){Index value;memcpy(&value,data.data()+i,sizeof(value));if(value>=vertices)return false;}return true;
 }
-// rebased: indices came from RebaseIndices, which already bounds every index.
-bool Finalize(Command& c,uint64_t resource,UINT offset,bool rebased=false){
+bool Finalize(Command& c,uint64_t resource,UINT offset){
     if(c.stride<12||c.stride>256||!c.vertices||c.data.size()!=size_t(c.vertices)*c.stride)return false;
     if(c.indices.size()){size_t width=c.indexFormat==D3DFMT_INDEX16?2:c.indexFormat==D3DFMT_INDEX32?4:0;if(!width||c.indices.size()!=size_t(VertexCount(c.primitive,c.count))*width)return false;
-        if(!rebased&&!(width==2?IndicesInRange<uint16_t>(c.indices,c.vertices):IndicesInRange<uint32_t>(c.indices,c.vertices)))return false;}
+        if(!(width==2?IndicesInRange<uint16_t>(c.indices,c.vertices):IndicesInRange<uint32_t>(c.indices,c.vertices)))return false;}
     if(skinOwner){resource=0;offset=0;} // CPU skin buffers may rotate; atomic identity does not.
     uint64_t h=Hash(&resource,sizeof(resource));h=Hash(&offset,4,h);h=Hash(&skinOwner,sizeof(skinOwner),h);h=Hash(c.textures.data(),sizeof(c.textures),h);h=Hash(&c.target,sizeof(c.target),h);h=Hash(&c.fvf,4,h);h=Hash(&c.stride,4,h);h=Hash(&c.vertices,4,h);h=Hash(&c.primitive,4,h);c.layoutKey=h;
     // Topology and UV coordinates anchor correspondence. Color changes may be
@@ -258,13 +235,13 @@ void CaptureUP(D3DPRIMITIVETYPE p,UINT count,const void* data,UINT stride,UINT m
     auto bytes=static_cast<const uint8_t*>(data);c->data.assign(bytes+size_t(min)*stride,bytes+size_t(min+vertices)*stride);
     if(indices){if(format!=D3DFMT_INDEX16&&format!=D3DFMT_INDEX32){Invalidate(Unsupported);return;}size_t width=format==D3DFMT_INDEX16?2:4;UINT n=VertexCount(p,count);auto source=static_cast<const uint8_t*>(indices);c->indices.assign(source,source+size_t(n)*width);
         if(!(width==2?RebaseIndices<uint16_t>(c->indices,min,vertices):RebaseIndices<uint32_t>(c->indices,min,vertices))){Invalidate(Unsupported);return;}}
-    if(!Finalize(*c,0,0,true)){Invalidate(Unsupported);return;}current.commands.push_back(std::move(c));
+    if(!Finalize(*c,0,0)){Invalidate(Unsupported);return;}current.commands.push_back(std::move(c));
 }
 void CaptureVB(D3DPRIMITIVETYPE p,UINT count,UINT start,UINT min,UINT vertices,bool indexed){
     if(!capturing||replaying)return;timing::Scope timer(timing::Capture);if(!vertices||vertices>1000000){Invalidate(Unsupported);return;}auto c=Acquire();c->primitive=p;c->count=count;c->vertices=vertices;
     if(!State(*c)){Invalidate(Unsupported,timing::StateRejected);return;}
     void* vb=nullptr;UINT stride=0;if(FAILED(D8<84>(device,UINT(0),&vb,&stride))||!vb){Release(vb);Invalidate(Unsupported,timing::BufferRejected);return;}
-    c->stride=stride;c->fromBuffer=true;auto it=shadows.find(vb);uint64_t id=it==shadows.end()?0:it->second.generation;UINT base=0;bool ok=true;
+    c->stride=stride;auto it=shadows.find(vb);uint64_t id=it==shadows.end()?0:it->second.generation;UINT base=0;bool ok=true;
     if(indexed){void* ib=nullptr;ok=SUCCEEDED(D8<86>(device,&ib,&base))&&ib;auto ii=shadows.find(ib);BufferDesc8 desc{};ok=ok&&ii!=shadows.end()&&SUCCEEDED(D8<13>(ib,&desc));
         if(ok){c->indexFormat=desc.format;size_t width=desc.format==D3DFMT_INDEX16?2:desc.format==D3DFMT_INDEX32?4:0;ok=width&&ii->second.Read(size_t(start)*width,size_t(VertexCount(p,count))*width,c->indices);
             if(ok)ok=width==2?RebaseIndices<uint16_t>(c->indices,min,vertices):RebaseIndices<uint32_t>(c->indices,min,vertices);}
@@ -275,7 +252,7 @@ void CaptureVB(D3DPRIMITIVETYPE p,UINT count,UINT start,UINT min,UINT vertices,b
     // Dynamic allocator offsets are transient. Only unambiguous material/topology
     // matches are accepted; duplicated keys are excluded by Match().
     if(!ok||offset>UINT_MAX){Invalidate(Unsupported,timing::BufferRejected);return;}
-    if(!Finalize(*c,dynamic?0:id,dynamic?0:UINT(offset),true)){Invalidate(Unsupported);return;}current.commands.push_back(std::move(c));
+    if(!Finalize(*c,dynamic?0:id,dynamic?0:UINT(offset))){Invalidate(Unsupported);return;}current.commands.push_back(std::move(c));
 }
 using DrawFn=HRESULT(__stdcall*)(void*,D3DPRIMITIVETYPE,UINT,UINT);
 using IndexedFn=HRESULT(__stdcall*)(void*,D3DPRIMITIVETYPE,UINT,UINT,UINT,UINT);
@@ -310,18 +287,12 @@ HRESULT __stdcall Copy(void* d,void* source,const RECT* rects,UINT n,void* targe
 }
 // Call at the bottom of the draw-hook chain: all earlier mods have already
 // contributed vertices and state. Re-entering those hooks would filter twice.
-UpFn driverUp=nullptr;IndexedUpFn driverIndexedUp=nullptr;DrawFn driverDraw=nullptr;IndexedFn driverIndexed=nullptr;
+UpFn driverUp=nullptr;IndexedUpFn driverIndexedUp=nullptr;
 using SceneFn=HRESULT(__stdcall*)(void*);SceneFn driverBegin=nullptr,driverEnd=nullptr;
 struct Restore {
     DWORD token=0;void* rt=nullptr;void* ds=nullptr;D3DVIEWPORT9 vp{};
-    // Cached geometry binds our buffers; put the caller's stream/indices back.
-    void* stream=nullptr;UINT stride=0;void* indices=nullptr;UINT base=0;bool streams=false;
-    bool Capture(){HRESULT depth=D8<33>(device,&ds);HRESULT state=restoreToken?D8<55>(device,restoreToken):D8<57>(device,D3DSBT_ALL,&restoreToken);token=restoreToken;
-        if(FAILED(D8<84>(device,UINT(0),&stream,&stride)))stream=nullptr;if(FAILED(D8<86>(device,&indices,&base)))indices=nullptr;
-        return SUCCEEDED(state)&&SUCCEEDED(D8<32>(device,&rt))&&(SUCCEEDED(depth)||depth==D3DERR_NOTFOUND)&&SUCCEEDED(D8<41>(device,&vp));}
-    ~Restore(){if(rt)D8<31>(device,rt,ds);if(token){D8<54>(device,token);D8<40>(device,&vp);}
-        if(streams){D8<83>(device,UINT(0),stream,stride);D8<85>(device,indices,base);}
-        Release(rt);Release(ds);Release(stream);Release(indices);}
+    bool Capture(){HRESULT depth=D8<33>(device,&ds);HRESULT state=restoreToken?D8<55>(device,restoreToken):D8<57>(device,D3DSBT_ALL,&restoreToken);token=restoreToken;return SUCCEEDED(state)&&SUCCEEDED(D8<32>(device,&rt))&&(SUCCEEDED(depth)||depth==D3DERR_NOTFOUND)&&SUCCEEDED(D8<41>(device,&vp));}
+    ~Restore(){if(rt)D8<31>(device,rt,ds);if(token){D8<54>(device,token);D8<40>(device,&vp);}Release(rt);Release(ds);}
 };
 using Matches=std::unordered_map<uint64_t,const Command*>;
 Matches Match(const Frame& f){Matches result;for(auto& c:f.commands)if(c->kind==Command::Draw&&c->scene3d){auto p=result.emplace(c->key,c.get());if(!p.second)p.first->second=nullptr;}return result;}
@@ -426,51 +397,6 @@ ReplayPlan PlanReplay(const Frame& f,const Matches& matches,const Frame* before=
     }
     return plan;
 }
-constexpr size_t GeometryBudget=24*1024*1024,GeometryUploadBudget=4*1024*1024;constexpr unsigned GeometryUploads=64;
-uint64_t GeometryKey(const Command& c){return c.key^(uint64_t(c.data.size())*0x9e3779b97f4a7c15ull)^(uint64_t(c.indices.size())<<17);}
-// Stability heuristic only (never identity): cached use always compares bytes.
-uint64_t QuickHash(const std::vector<uint8_t>& v,uint64_t seed){
-    uint32_t a=uint32_t(seed)^uint32_t(v.size()),b=uint32_t(seed>>32)^0x85ebca6bu;size_t i=0;const uint8_t* p=v.data();
-    for(;i+8<=v.size();i+=8){uint32_t x,y;memcpy(&x,p+i,4);memcpy(&y,p+i+4,4);a=(a^x)*0x01000193u;a^=a>>15;b=(b^y)*0x27d4eb2fu;b^=b>>13;}
-    for(;i<v.size();i++)a=(a^p[i])*0x01000193u;return (uint64_t(a)<<32)|b;
-}
-bool SameGeometry(const Geometry& g,const Command& c){return g.stride==c.stride&&g.fvf==c.fvf&&g.indexFormat==c.indexFormat&&g.data==c.data&&g.indices==c.indices;}
-std::shared_ptr<Geometry> UploadGeometry(const Command& c){
-    const size_t bytes=c.data.size()+c.indices.size();
-    if(!oldCreateVB||!oldCreateIB||c.data.size()>UINT_MAX||c.indices.size()>UINT_MAX||geometryBytes>GeometryBudget||bytes>GeometryBudget-geometryBytes)return nullptr;
-    auto g=std::make_shared<Geometry>();BYTE* p=nullptr;
-    if(FAILED(oldCreateVB(device,UINT(c.data.size()),D3DUSAGE_WRITEONLY,c.fvf,D3DPOOL_MANAGED,&g->vb))||!g->vb){g->vb=nullptr;return nullptr;}
-    if(FAILED(D8<11>(g->vb,UINT(0),UINT(0),&p,DWORD(0)))||!p)return nullptr;memcpy(p,c.data.data(),c.data.size());D8<12>(g->vb);
-    if(!c.indices.empty()){
-        if(FAILED(oldCreateIB(device,UINT(c.indices.size()),D3DUSAGE_WRITEONLY,DWORD(c.indexFormat),D3DPOOL_MANAGED,&g->ib))||!g->ib){g->ib=nullptr;return nullptr;}
-        p=nullptr;if(FAILED(D8<11>(g->ib,UINT(0),UINT(0),&p,DWORD(0)))||!p)return nullptr;memcpy(p,c.indices.data(),c.indices.size());D8<12>(g->ib);
-    }
-    g->data=c.data;g->indices=c.indices;g->fvf=c.fvf;g->stride=c.stride;g->indexFormat=c.indexFormat;geometryBytes+=bytes;return g;
-}
-// Attach GPU copies to buffer draws whose bytes did not change. Animated and
-// CPU-skinned geometry keeps the immediate path, so it never churns buffers.
-unsigned PrepareGeometry(Frame& f,const ReplayPlan& plan){
-    ++geometryTick;std::swap(geometrySeen,geometrySeenBefore);geometrySeen.clear();
-    size_t uploadedBytes=0;unsigned uploads=0,attached=0;
-    for(size_t i=0;i<f.commands.size()&&i<plan.draws.size();i++){auto& c=*f.commands[i];
-        if(c.kind!=Command::Draw||!c.fromBuffer||c.skinned||c.data.empty())continue;
-        const auto& draw=plan.draws[i];const bool unchanged=draw.prior&&draw.unchanged;
-        if(unchanged&&draw.prior->geometry)c.geometry=draw.prior->geometry; // bytes already compared
-        else{
-            const uint64_t key=GeometryKey(c);auto range=geometryCache.equal_range(key);
-            for(auto it=range.first;it!=range.second;++it)if(SameGeometry(*it->second,c)){c.geometry=it->second;break;}
-            if(!c.geometry){
-                bool stable=unchanged;
-                if(!draw.prior){uint64_t h=QuickHash(c.indices,QuickHash(c.data,key));auto seen=geometrySeenBefore.find(key);stable=seen!=geometrySeenBefore.end()&&seen->second==h;geometrySeen[key]=h;}
-                const size_t bytes=c.data.size()+c.indices.size();
-                if(stable&&uploads<GeometryUploads&&bytes<=GeometryUploadBudget-uploadedBytes)if(auto g=UploadGeometry(c)){c.geometry=g;geometryCache.emplace(key,std::move(g));++uploads;uploadedBytes+=bytes;}
-            }
-        }
-        if(c.geometry){c.geometry->used=geometryTick;++attached;}
-    }
-    for(auto it=geometryCache.begin();it!=geometryCache.end();)if(it->second->used+2<geometryTick)it=geometryCache.erase(it);else ++it;
-    return attached;
-}
 bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* prepared=nullptr){
     timing::Scope timer(matches?timing::Replay:timing::Restore);
     Restore restore;if(!restore.Capture())return false;bool inScene=false,ok=true;auto& mixed=mixedScratch;
@@ -479,7 +405,6 @@ bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* 
     bool cameraCut=false;for(auto& v:views){v.valid=ViewMotion(v.previous,v.current,v.previousProjection,v.projection,v.canvas,alpha,v.camera,v.lens);if(!v.valid)cameraCut=true;}
     auto end=[&](){if(inScene){if(FAILED(driverEnd(device)))ok=false;inScene=false;}};
     void* rt=nullptr;void* ds=nullptr;D3DVIEWPORT9 viewport{};bool viewportValid=false;
-    void* boundStream=reinterpret_cast<void*>(~uintptr_t(0));void* boundIndices=boundStream;UINT boundStride=0;
     for(size_t commandIndex=0;commandIndex<f.commands.size();commandIndex++){const auto& c=*f.commands[commandIndex];
         if(c.kind==Command::Copy){end();if(FAILED(oldCopy(device,c.source,c.copyRects.empty()?nullptr:c.copyRects.data(),c.count,c.target,c.points.empty()?nullptr:c.points.data())))ok=false;continue;}
         if(rt!=c.target||ds!=c.depth){end();if(FAILED(D8<31>(device,c.target,c.depth))){ok=false;break;}rt=c.target;ds=c.depth;viewportValid=false;}
@@ -506,16 +431,7 @@ bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* 
         // Apply final interpolated transforms directly; avoid restoring the
         // native camera and then immediately replacing it for every draw.
         if(!pipeline::ApplyDraw(c.gpu,&world,&camera,&projection)){ok=false;break;}
-        HRESULT hr;
-        if(c.geometry&&vertices==c.data.data()){const auto& g=*c.geometry;
-            // Same submission path as the native buffer draw; no vertex upload.
-            if(boundStream!=g.vb||boundStride!=c.stride){restore.streams=true;if(FAILED(D8<83>(device,UINT(0),g.vb,c.stride))){ok=false;break;}boundStream=g.vb;boundStride=c.stride;}
-            if(g.ib&&boundIndices!=g.ib){restore.streams=true;if(FAILED(D8<85>(device,g.ib,UINT(0)))){ok=false;break;}boundIndices=g.ib;}
-            hr=g.ib?driverIndexed(device,c.primitive,0,c.vertices,0,c.count):driverDraw(device,c.primitive,0,c.count);
-        }else{
-            hr=c.indices.empty()?driverUp(device,c.primitive,c.count,vertices,c.stride):driverIndexedUp(device,c.primitive,0,c.vertices,c.count,c.indices.data(),c.indexFormat,vertices,c.stride);
-            boundStream=boundIndices=nullptr; // UP draws unbind stream 0 and indices
-        }
+        HRESULT hr=c.indices.empty()?driverUp(device,c.primitive,c.count,vertices,c.stride):driverIndexedUp(device,c.primitive,0,c.vertices,c.count,c.indices.data(),c.indexFormat,vertices,c.stride);
         if(FAILED(hr)){ok=false;break;}
     }
     end();return ok;
@@ -535,22 +451,6 @@ HRESULT Submit(void* d,const RECT* src,const RECT* dst,HWND hwnd,const RGNDATA* 
     else timing::frame.reasons|=timing::Failed;
     return hr;
 }
-// Caps interpolated images per tick from observed overload (late native image
-// or missed slots). Three overloaded ticks within 64 shed images; a calm period
-// adds one back. Raising again soon after a shed doubles the calm period.
-struct ImageGovernor {
-    static constexpr unsigned Unlocked=64,Unlimited=~0u;
-    unsigned limit=Unlimited,calm=0,patience=120,sinceRaise=Unlimited;uint64_t recent=0;
-    void Observe(bool overloaded,unsigned used,unsigned wanted){
-        recent=(recent<<1)|uint64_t(overloaded);if(sinceRaise!=Unlimited)++sinceRaise;
-        if(overloaded){calm=0;
-            if(std::bitset<64>(recent).count()>=3&&used){limit=std::min(limit,used-std::max(1u,used/4));recent=0;
-                patience=sinceRaise<600?std::min(patience*2,3840u):120;sinceRaise=Unlimited;}
-            return;}
-        if(limit>=wanted){limit=Unlimited;calm=0;return;}
-        if(++calm>=patience){++limit;calm=0;sinceRaise=0;}
-    }
-} governor;
 HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,const RGNDATA* dirty){
     bool needNative=deferredPending;deferredPending=deferArmed=deferCandidate=false;
     timing::BeforePresent();timing::frame.draws=uint32_t(current.commands.size());timing::frame.bytes=uint32_t(current.bytes);
@@ -568,11 +468,8 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     {timing::Scope timer(timing::Match);if(history){matches=Match(previous);auto currentKeys=Match(current);for(auto& p:currentKeys)if(!p.second)matches.erase(p.first);plan=PlanReplay(current,matches,&previous);if(!plan.usable){history=false;unmatched=true;timing::frame.reasons|=timing::Unmatched;}}}
     replayCost=std::max(.00005,replayCost*.9);
     timing::frame.warmup=warmup;if(warmup){--warmup;history=false;timing::frame.reasons|=timing::Warming;}
-    if(history&&clockValid){timing::Scope timer(timing::Match);timing::frame.cached=PrepareGeometry(current,plan);}
     unsigned images=divisions?divisions-1:0;double first=tickStart+interval,step=interval;
-    const unsigned limit=governor.limit;timing::frame.imageLimit=limit>999?999:limit;
     if(history&&clockValid&&!unlocked){
-        if(images>limit){images=limit;timing::frame.reasons|=timing::Governed;}
         // Keep the requested slots when the first one is reachable. A late native
         // frame presents its first image as soon as it can be replayed and spaces
         // the rest evenly up to the native image; alpha follows each image's time.
@@ -583,15 +480,14 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
         if(images+1<requested){timing::frame.reasons|=timing::PacingReduced;timing::frame.skipped+=requested-1-images;}
     }
     timing::frame.plannedImages=images+1;
-    unsigned presented=0,attempted=0,missed=0;bool overwritten=false,ok=true;double lastPresentation=0;
+    unsigned presented=0;bool overwritten=false,ok=true;double lastPresentation=0;
     if(history&&clockValid){
         replaying=true;
         if(unlocked){
             // No presentation-rate cap. Leave time for the authoritative image
             // and never run simulation more than once per native 60 Hz tick.
             const double end=tickStart+1.0/60;float lastAlpha=0;
-            if(limit<ImageGovernor::Unlocked)timing::frame.reasons|=timing::Governed;
-            while(attempted<limit&&Now()+replayCost*2+.00025<end){++attempted;
+            while(Now()+replayCost*2+.00025<end){
                 float alpha=float(std::clamp((Now()+replayCost-tickStart)*60,0.0,.999));
                 if(alpha<=lastAlpha)break;
                 double start=Now();overwritten=true;ok=Replay(current,&matches,alpha,&plan);
@@ -602,12 +498,11 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
             }
         }else for(unsigned image=0;image<images;image++){
             double deadline=first+image*step;
-            ++attempted;
-            if(Now()+replayCost>deadline-.0001||deadline-lastPresentation<interval*.75){++missed;++timing::frame.skipped;timing::frame.reasons|=timing::EarlySlotMiss;continue;}
+            if(Now()+replayCost>deadline-.0001||deadline-lastPresentation<interval*.75){++timing::frame.skipped;timing::frame.reasons|=timing::EarlySlotMiss;continue;}
             double start=Now();overwritten=true;ok=Replay(current,&matches,float(std::min(.999,(deadline-tickStart)*60)),&plan);
             double cost=Now()-start;replayCost=std::clamp(replayCost*.75+cost*.25,.00005,.02);
             if(!ok)break;
-            if(Now()>deadline+.0005){++missed;++timing::frame.skipped;timing::frame.reasons|=timing::LateReplay;continue;}
+            if(Now()>deadline+.0005){++timing::frame.skipped;timing::frame.reasons|=timing::LateReplay;continue;}
             Until(deadline);lastPresentation=Now();HRESULT extra=Submit(d,nullptr,nullptr,nullptr,nullptr,false);
             if(FAILED(extra)){ok=false;break;}++presented;
         }
@@ -618,29 +513,23 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     timing::frame.estimateMs=replayCost*1000;if(!ok)timing::frame.reasons|=timing::Failed;
     paired=presented>0&&ok;
     if(!sync)counters.status=unmatched?Unsupported:paired&&(unlocked||presented+1==requested)?Active:history?TooSlow:Waiting;
-    const double boundary=tickStart+1.0/60;const bool timed=clockValid;
-    if(clockValid)Until(boundary);
+    if(clockValid)Until(tickStart+1.0/60);
     HRESULT hr=Submit(d,src,dst,hwnd,dirty,true);
-    // A GPU that cannot keep up makes Present block until the native image is
-    // late, which slows the game itself. Shed interpolated images instead.
-    // Only ticks that rendered images can count as overloaded; a native-only
-    // tick (including one held at limit 0) counts toward restoring images.
-    if(timed&&history&&SUCCEEDED(hr))governor.Observe(attempted>0&&(missed>0||Now()-boundary>.002),attempted,unlocked?ImageGovernor::Unlocked:requested-1);
     if(FAILED(hr)){ClearHistory();counters.status=DeviceLost;clockValid=false;}
     else {Recycle(previous);previous=std::move(current);current=Frame{};}
     return hr;
 }
-HRESULT __stdcall Reset(void* d,Present8* p){deferredPending=deferArmed=deferCandidate=false;nativeScene=false;capturing=false;ClearHistory();clockValid=false;paired=false;pacedTick=false;governor=ImageGovernor{};HRESULT hr=oldReset(d,p);pipeline::dirty=true;pipeline::recording=false;counters.status=FAILED(hr)?DeviceLost:Waiting;return hr;}
+HRESULT __stdcall Reset(void* d,Present8* p){deferredPending=deferArmed=deferCandidate=false;nativeScene=false;capturing=false;ClearHistory();clockValid=false;paired=false;pacedTick=false;HRESULT hr=oldReset(d,p);pipeline::dirty=true;pipeline::recording=false;counters.status=FAILED(hr)?DeviceLost:Waiting;return hr;}
 bool InstallDevice(void* d){
     if(!d)return false;if(device==d)return deviceReady;
-    if(device){capturing=false;ClearHistory();governor=ImageGovernor{};Release(device);clockValid=false;paired=false;}
+    if(device){capturing=false;ClearHistory();Release(device);clockValid=false;paired=false;}
     device=d;Ref(device);auto t=*static_cast<void***>(d);
     // Some backends share a vtable across replacement devices. Do not insert
     // our hook twice or turn the saved chain into recursive self-calls.
     if(t[15]==reinterpret_cast<void*>(&Present)){deviceReady=true;return true;}
     // Capture before Video Settings installs its later hooks; those hooks still
     // flow through ours, and replay uses the driver functions saved here.
-    driverUp=reinterpret_cast<UpFn>(t[72]);driverIndexedUp=reinterpret_cast<IndexedUpFn>(t[73]);driverDraw=reinterpret_cast<DrawFn>(t[70]);driverIndexed=reinterpret_cast<IndexedFn>(t[71]);driverBegin=reinterpret_cast<SceneFn>(t[34]);driverEnd=reinterpret_cast<SceneFn>(t[35]);
+    driverUp=reinterpret_cast<UpFn>(t[72]);driverIndexedUp=reinterpret_cast<IndexedUpFn>(t[73]);driverBegin=reinterpret_cast<SceneFn>(t[34]);driverEnd=reinterpret_cast<SceneFn>(t[35]);
     bool ok=Slot(t,23,&CreateVB,oldCreateVB)&&Slot(t,24,&CreateIB,oldCreateIB)&&Slot(t,70,&Draw,oldDraw)&&Slot(t,71,&Indexed,oldIndexed)&&Slot(t,72,&Up,oldUp)&&Slot(t,73,&IndexedUp,oldIndexedUp)&&Slot(t,36,&Clear,oldClear)&&Slot(t,28,&Copy,oldCopy)&&Slot(t,29,&UpdateTexture,oldUpdateTexture)&&Slot(t,15,&Present,oldPresent)&&Slot(t,14,&Reset,oldReset);
     ok=ok&&pipeline::Install(t)&&InstallDeferred(t);deviceReady=ok;if(!ok)counters.status=Incompatible;return ok;
 }
@@ -726,7 +615,7 @@ bool Save(){
     if(ini.empty())return true;auto tmp=ini+L".tmp";std::ofstream out(tmp,std::ios::trunc);out<<"[Motion]\nEnabled="<<settings.enabled<<"\nCamera="<<settings.camera<<"\nGeometry="<<settings.geometry<<"\nCutProtection="<<settings.cutProtection<<"\nTargetHz="<<settings.targetHz<<"\nMenus="<<settings.menus<<"\nShowFps="<<settings.showFps<<"\nLogging="<<settings.logging<<"\n";out.close();return out&&MoveFileExW(tmp.c_str(),ini.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
 }
 void __cdecl Get(Settings* out){if(out&&out->size==sizeof(Settings))*out=settings;}
-int __cdecl Set(const Settings* input){if(!input||input->size!=sizeof(Settings)||input->enabled>1||input->camera>1||input->geometry>1||input->cutProtection>1||input->menus>1||input->showFps>1||input->logging>1||!ValidFps(input->targetHz))return 0;auto saved=settings;settings=*input;settings.enabled=settings.targetHz!=60;if(!Save()){settings=saved;return 0;}timing::enabled.store(settings.logging!=0,std::memory_order_relaxed);bool renderingChanged=saved.enabled!=settings.enabled||saved.camera!=settings.camera||saved.geometry!=settings.geometry||saved.cutProtection!=settings.cutProtection||saved.targetHz!=settings.targetHz||saved.menus!=settings.menus;if(renderingChanged){ClearHistory();governor=ImageGovernor{};clockValid=false;paired=pacedTick=false;counters.status=settings.enabled?Waiting:Off;}return 1;}
+int __cdecl Set(const Settings* input){if(!input||input->size!=sizeof(Settings)||input->enabled>1||input->camera>1||input->geometry>1||input->cutProtection>1||input->menus>1||input->showFps>1||input->logging>1||!ValidFps(input->targetHz))return 0;auto saved=settings;settings=*input;settings.enabled=settings.targetHz!=60;if(!Save()){settings=saved;return 0;}timing::enabled.store(settings.logging!=0,std::memory_order_relaxed);bool renderingChanged=saved.enabled!=settings.enabled||saved.camera!=settings.camera||saved.geometry!=settings.geometry||saved.cutProtection!=settings.cutProtection||saved.targetHz!=settings.targetHz||saved.menus!=settings.menus;if(renderingChanged){ClearHistory();clockValid=false;paired=pacedTick=false;counters.status=settings.enabled?Waiting:Off;}return 1;}
 void __cdecl GetStats(Stats* out){if(out&&out->size==sizeof(Stats)){*out=counters;double now=Now();out->renderFps=frameRates.output.At(now);out->baseFps=frameRates.base.At(now);out->frameMs=frameRates.lastMs;out->peakMs=frameRates.Peak(now);out->loggingError=timing::ioError.load(std::memory_order_relaxed);}}
 void __cdecl SetOverlay(Overlay draw){overlay=draw;}
 const Api api{sizeof(Api),Abi,&Get,&Set,&GetStats,&SetOverlay};

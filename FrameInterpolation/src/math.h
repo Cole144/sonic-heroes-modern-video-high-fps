@@ -77,19 +77,7 @@ inline bool Projection(const Matrix& a,const Matrix& b,float t,Matrix& out,bool 
     if(protect&&(b.m[0][0]/a.m[0][0]<.5f||b.m[0][0]/a.m[0][0]>2||b.m[1][1]/a.m[1][1]<.5f||b.m[1][1]/a.m[1][1]>2))return false;
     for(int i=0;i<4;i++)for(int j=0;j<4;j++){if(!std::isfinite(a.m[i][j])||!std::isfinite(b.m[i][j]))return false;out.m[i][j]=a.m[i][j]+(b.m[i][j]-a.m[i][j])*t;}return true;
 }
-// Streaming identity hash: chaining Hash(b,n,Hash(a,m)) continues the stream.
-// Two 32-bit Murmur3 lanes over 4-byte words. The former byte-wise 64-bit FNV
-// needed several 32-bit multiplies per byte on x86 and dominated capture of
-// draws without a unique previous match (repeated objects).
-inline uint32_t HashWord(uint32_t h,uint32_t k){k*=0xcc9e2d51u;k=(k<<15)|(k>>17);k*=0x1b873593u;h^=k;h=(h<<13)|(h>>19);return h*5+0xe6546b64u;}
-inline uint64_t Hash(const void* data,size_t n,uint64_t h=14695981039346656037ull){
-    auto p=static_cast<const uint8_t*>(data);uint32_t a=uint32_t(h),b=uint32_t(h>>32);size_t i=0;
-    for(;i+8<=n;i+=8){uint32_t x,y;memcpy(&x,p+i,4);memcpy(&y,p+i+4,4);a=HashWord(a,x);b=HashWord(b,y);}
-    if(n-i>=4){uint32_t x;memcpy(&x,p+i,4);a=HashWord(a,x);i+=4;}
-    uint32_t tail=0;for(unsigned shift=0;i<n;i++,shift+=8)tail|=uint32_t(p[i])<<shift;
-    b=HashWord(b,tail^(uint32_t(n)*0x9e3779b9u)); // length-separated tail
-    return (uint64_t(b)<<32)|a;
-}
+inline uint64_t Hash(const void* data,size_t n,uint64_t h=14695981039346656037ull){auto p=static_cast<const uint8_t*>(data);for(size_t i=0;i<n;i++){h^=p[i];h*=1099511628211ull;}return h;}
 inline bool Positions(const std::vector<uint8_t>& a,const std::vector<uint8_t>& b,unsigned stride,float t,bool normals,bool protect,std::vector<uint8_t>& out){
     if(stride<12||a.size()!=b.size()||b.size()%stride)return false;out=b;
     // Load/store precisely 12 bytes, including the final tightly packed vertex.

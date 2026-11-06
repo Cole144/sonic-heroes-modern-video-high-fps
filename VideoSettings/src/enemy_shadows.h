@@ -9,6 +9,7 @@
 namespace enemy_shadows {
 struct Vec {float x,y,z;};
 inline bool installed=false,enabled=false,drawing=false;
+inline bool probing=false; // collecting a blinking enemy's clumps; nothing may draw
 inline D3DMATRIX projection{};
 inline DWORD tint=0x70000000;
 inline unsigned submitted=0;

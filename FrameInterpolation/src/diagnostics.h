@@ -10,12 +10,12 @@
 namespace timing {
 inline double Clock(){static const double inverse=[](){LARGE_INTEGER f;QueryPerformanceFrequency(&f);return 1.0/double(f.QuadPart);}();LARGE_INTEGER n;QueryPerformanceCounter(&n);return double(n.QuadPart)*inverse;}
 enum Phase {Capture,State,Match,Replay,Restore,Overlay,Present,Wait,Cleanup,BufferMirror,PhaseCount};
-enum Reason:uint32_t {Inactive=1,NoHistory=2,Warming=4,Unmatched=8,EarlySlotMiss=16,LateReplay=32,Synchronized=64,Unsupported=128,Failed=256,PacingReduced=512,TextureResync=1024,StateRejected=2048,BufferRejected=4096,GeometryRejected=8192,TextureMutation=16384,FeedbackRejected=32768,CapacityRejected=65536,NativeDeferred=131072,DeferredBarrier=262144,BarrierTarget=524288,BarrierClear=1048576,BarrierUncaptured=2097152,BarrierResource=4194304,BarrierReadback=8388608,StreamingBuffer=33554432,Governed=67108864};
+enum Reason:uint32_t {Inactive=1,NoHistory=2,Warming=4,Unmatched=8,EarlySlotMiss=16,LateReplay=32,Synchronized=64,Unsupported=128,Failed=256,PacingReduced=512,TextureResync=1024,StateRejected=2048,BufferRejected=4096,GeometryRejected=8192,TextureMutation=16384,FeedbackRejected=32768,CapacityRejected=65536,NativeDeferred=131072,DeferredBarrier=262144,BarrierTarget=524288,BarrierClear=1048576,BarrierUncaptured=2097152,BarrierResource=4194304,BarrierReadback=8388608,StreamingBuffer=33554432};
 struct Record {
     uint64_t sequence=0,context=0;
     double time=0,tickMs=0,preDrawMs=0,renderMs=0,phase[PhaseCount]{};
     uint32_t target=60,menu=0,action=0,status=0,draws=0,bytes=0,submissions=0,generated=0,skipped=0,reasons=0,warmup=0;
-    double estimateMs=0,maxPresentGapMs=0;uint32_t dropped=0,plannedImages=0,cached=0,imageLimit=0;
+    double estimateMs=0,maxPresentGapMs=0;uint32_t dropped=0,plannedImages=0;
 };
 #pragma warning(push)
 #pragma warning(disable:4324) // Intentional cache-line separation for producer/consumer.
@@ -55,12 +55,12 @@ inline void FinishTick(uint32_t target,uint32_t status){
     }
     frame={};drawStart=0;previousSync=now;
 }
-inline const char* Header="sequence,time_s,context,menu,action,target,status,tick_ms,pre_draw_ms,render_including_capture_ms,capture_ms,state_ms,match_ms,replay_ms,restore_ms,overlay_ms,present_ms,wait_ms,cleanup_ms,draws,bytes,submissions,generated,skipped,reason_bits,warmup,replay_estimate_ms,max_present_gap_ms,dropped,planned_images,buffer_mirror_ms,cached_draws,image_limit\n";
+inline const char* Header="sequence,time_s,context,menu,action,target,status,tick_ms,pre_draw_ms,render_including_capture_ms,capture_ms,state_ms,match_ms,replay_ms,restore_ms,overlay_ms,present_ms,wait_ms,cleanup_ms,draws,bytes,submissions,generated,skipped,reason_bits,warmup,replay_estimate_ms,max_present_gap_ms,dropped,planned_images,buffer_mirror_ms\n";
 inline int Format(const Record& r,char* line,size_t capacity){return _snprintf_s(line,capacity,_TRUNCATE,
-    "%llu,%.6f,%llu,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%u,%u,%.4f,%u,%u\n",
+    "%llu,%.6f,%llu,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u,%u,%u,%u,%u,%.4f,%.4f,%u,%u,%.4f\n",
     r.sequence,r.time,r.context,r.menu,r.action,r.target,r.status,r.tickMs,r.preDrawMs,r.renderMs,
     r.phase[Capture],r.phase[State],r.phase[Match],r.phase[Replay],r.phase[Restore],r.phase[Overlay],r.phase[Present],r.phase[Wait],r.phase[Cleanup],
-    r.draws,r.bytes,r.submissions,r.generated,r.skipped,r.reasons,r.warmup,r.estimateMs,r.maxPresentGapMs,r.dropped,r.plannedImages,r.phase[BufferMirror],r.cached,r.imageLimit);}
+    r.draws,r.bytes,r.submissions,r.generated,r.skipped,r.reasons,r.warmup,r.estimateMs,r.maxPresentGapMs,r.dropped,r.plannedImages,r.phase[BufferMirror]);}
 inline bool WriteAll(HANDLE file,const char* data,DWORD size){while(size){DWORD wrote=0;if(!WriteFile(file,data,size,&wrote,nullptr)||!wrote){ioError.store(GetLastError()?GetLastError():ERROR_WRITE_FAULT);return false;}data+=wrote;size-=wrote;}return true;}
 inline DWORD WINAPI Writer(void*){
     // Four rotating 16 MiB segments bound a session's disk usage. Only this

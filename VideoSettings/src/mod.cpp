@@ -9,6 +9,7 @@
 #include "enemy_shadows.h"
 #include "object_shadows.h"
 #include "self_shadows.h"
+#include "wall_shadows.h"
 #include <bcrypt.h>
 #include <filesystem>
 #include <fstream>
@@ -301,11 +302,11 @@ __declspec(naked) void CompareDestroy(){
     }
 }
 bool CompareHook(uintptr_t at,const unsigned char* expected,size_t length,void* replacement,void*& original){
-    if(memcmp(reinterpret_cast<void*>(at),expected,length))return false;
+    if(length<5||length>8||memcmp(reinterpret_cast<void*>(at),expected,length))return false;
     auto stub=static_cast<unsigned char*>(VirtualAlloc(nullptr,length+5,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE));if(!stub)return false;
     memcpy(stub,expected,length);stub[length]=0xe9;*reinterpret_cast<int32_t*>(stub+length+1)=int32_t(at+length-reinterpret_cast<uintptr_t>(stub+length+5));
     DWORD old;if(!VirtualProtect(stub,length+5,PAGE_EXECUTE_READ,&old)){VirtualFree(stub,0,MEM_RELEASE);return false;}
-    FlushInstructionCache(GetCurrentProcess(),stub,length+5);unsigned char patch[6]={0xe9,0,0,0,0,0x90};
+    FlushInstructionCache(GetCurrentProcess(),stub,length+5);unsigned char patch[8]={0xe9,0,0,0,0,0x90,0x90,0x90};
     *reinterpret_cast<int32_t*>(patch+1)=int32_t(reinterpret_cast<uintptr_t>(replacement)-at-5);original=stub;
     if(!Write(reinterpret_cast<void*>(at),patch,length)){original=nullptr;VirtualFree(stub,0,MEM_RELEASE);return false;}return true;
 }
@@ -318,16 +319,31 @@ bool InstallShadowCompare(){
 }
 void* originalEnemyOpaque=nullptr,*originalEnemyTransparent=nullptr,*originalEnemyClump=nullptr;
 void* originalSelfPlayerAtomic=nullptr;
-void* originalEntryFloat=nullptr,*originalEntryAngle=nullptr;
+void* originalEntryFloat=nullptr,*originalEntryAngle=nullptr,*originalEntryShaped=nullptr;
 bool EnemyModelsEnabled(){return enemy_shadows::installed&&enemy_shadows::enabled&&!shadow_compare::original;}
 void SelfShadowGroup(void* const* clumps,unsigned count);
+// Hit enemies blink: TObjEnemy's timers (+0x191..+0x198, read by 0x5e42a0)
+// make their draw skip every model on alternate frames, while the native
+// shadow keeps drawing. With nothing recorded the silhouette fell back to the
+// blob on those frames. Re-run the draw with timers cleared and model
+// rendering suppressed, only to learn which clumps it would draw.
+using BlinkFn=int(__thiscall*)(void*);BlinkFn enemyBlink=reinterpret_cast<BlinkFn>(0x5e42a0);
+constexpr size_t EnemyBlinkTimers=0x191,EnemyBlinkTimerCount=8;
 int __fastcall EnemyOpaque(void* actor,void*){
     auto before=enemy_shadows::recording;
     enemy_shadows::recording=(EnemyModelsEnabled()||self_shadows::enabled)?enemy_shadows::Record(actor):nullptr;
-    auto selfCaster=enemy_shadows::recording;
-    int result=reinterpret_cast<int(__thiscall*)(void*)>(originalEnemyOpaque)(actor);
+    auto caster=enemy_shadows::recording;
+    auto disp=reinterpret_cast<int(__thiscall*)(void*)>(originalEnemyOpaque);
+    int result=disp(actor);
+    const bool drawn=caster&&caster->count;
+    if(caster&&!drawn&&caster->supported&&EnemyModelsEnabled()&&enemyBlink(actor)>0){
+        auto timers=static_cast<unsigned char*>(actor)+EnemyBlinkTimers;unsigned char saved[EnemyBlinkTimerCount];
+        memcpy(saved,timers,sizeof(saved));memset(timers,0,sizeof(saved));
+        enemy_shadows::probing=true;disp(actor);enemy_shadows::probing=false;
+        memcpy(timers,saved,sizeof(saved));
+    }
     enemy_shadows::recording=before;
-    if(selfCaster&&selfCaster->supported)SelfShadowGroup(selfCaster->clumps.data(),selfCaster->count);return result;
+    if(drawn&&caster->supported)SelfShadowGroup(caster->clumps.data(),caster->count);return result;
 }
 int __fastcall EnemyTransparent(void* actor,void*){
     auto before=enemy_shadows::casting;bool replaced=enemy_shadows::replaced;
@@ -336,6 +352,7 @@ int __fastcall EnemyTransparent(void* actor,void*){
     enemy_shadows::casting=before;enemy_shadows::replaced=replaced;return result;
 }
 void* __cdecl EnemyClump(void* clump){
+    if(enemy_shadows::probing){if(enemy_shadows::recording)enemy_shadows::recording->Add(clump);return clump;} // RpClumpRender returns its clump
     if(enemy_shadows::recording&&!enemy_shadows::drawing)enemy_shadows::recording->Add(clump);
     auto result=reinterpret_cast<void*(__cdecl*)(void*)>(originalEnemyClump)(clump);
     return result;
@@ -445,16 +462,42 @@ __declspec(naked) void EnemyEntryAngle(){
         jmp dword ptr [originalEntryAngle]
     }
 }
+// Egg Flapper, Klagen and E-series shaped shadows: float angles like 0x63b7b0,
+// plus a fixed quad offset. Same usercall arguments, so the same stub layout.
+__declspec(naked) void EnemyEntryShaped(){
+    __asm {
+        pushfd
+        pushad
+        mov edx,esp
+        push 0
+        push dword ptr [edx+48]
+        push dword ptr [edx+40]
+        push dword ptr [edx+28]
+        call TryEnemyShadow
+        test eax,eax
+        jz native
+        popad
+        popfd
+        ret
+    native:
+        popad
+        popfd
+        jmp dword ptr [originalEntryShaped]
+    }
+}
 bool InstallEnemyShadows(){
     const unsigned char actor[]={0x83,0xec,0x0c,0x56,0x8b,0xf1},clump[]={0x8b,0x44,0x24,0x04,0x53},entry[]={0x83,0xec,0x70,0x56,0x8b,0xf0};
+    const unsigned char shaped[]={0xd9,0x44,0x24,0x0c,0x83,0xec,0x7c},blink[]={0x0f,0xbe,0x91,0x91,0x01,0x00,0x00};
     // Verify every site before installing any of this optional feature.
     if(memcmp(reinterpret_cast<void*>(0x5e2740),actor,6)||memcmp(reinterpret_cast<void*>(0x5e2790),actor,6)||
-       memcmp(reinterpret_cast<void*>(0x66b4f0),clump,5)||memcmp(reinterpret_cast<void*>(0x63b7b0),entry,6)||memcmp(reinterpret_cast<void*>(0x63b900),entry,6))return false;
+       memcmp(reinterpret_cast<void*>(0x66b4f0),clump,5)||memcmp(reinterpret_cast<void*>(0x63b7b0),entry,6)||memcmp(reinterpret_cast<void*>(0x63b900),entry,6)||
+       memcmp(reinterpret_cast<void*>(0x63bcd0),shaped,7)||memcmp(reinterpret_cast<void*>(0x5e42a0),blink,7))return false;
     return CompareHook(0x5e2740,actor,6,reinterpret_cast<void*>(&EnemyOpaque),originalEnemyOpaque)&&
         CompareHook(0x5e2790,actor,6,reinterpret_cast<void*>(&EnemyTransparent),originalEnemyTransparent)&&
         CompareHook(0x66b4f0,clump,5,reinterpret_cast<void*>(&EnemyClump),originalEnemyClump)&&
         CompareHook(0x63b7b0,entry,6,reinterpret_cast<void*>(&EnemyEntryFloat),originalEntryFloat)&&
-        CompareHook(0x63b900,entry,6,reinterpret_cast<void*>(&EnemyEntryAngle),originalEntryAngle);
+        CompareHook(0x63b900,entry,6,reinterpret_cast<void*>(&EnemyEntryAngle),originalEntryAngle)&&
+        CompareHook(0x63bcd0,shaped,7,reinterpret_cast<void*>(&EnemyEntryShaped),originalEntryShaped);
 }
 ExecFn originalSignalShadow=nullptr,originalRingShadow=nullptr;
 bool ObjectModelsEnabled(){return object_shadows::installed&&current.objectShadows&&!shadow_compare::original;}
@@ -745,11 +788,17 @@ struct NativeFade {
     }
     ~NativeFade(){if(active){for(int i=0;i<6;i++)TS(device,1,stages[i],stage[i]);for(int i=0;i<5;i++)RS(device,states[i],state[i]);}}
 };
+// Character shadows on walls: the native receiver pass smears them into
+// vertical stripes. Original-shadow comparison keeps the native result.
+const wall_shadows::Entry* ReceiverPlan(void* d,D3DPRIMITIVETYPE t,bool indexed,UINT min,UINT n,UINT first,UINT count){
+    if(d!=Device()||!current.shadows||shadow_compare::original||ui::drawing)return nullptr;
+    return wall_shadows::Prepare(d,t,indexed,min,n,first,count);
+}
 void CaptureRetained(void* d);
-HRESULT __stdcall Draw(void* d,D3DPRIMITIVETYPE t,UINT first,UINT count){if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalDraw(d,t,first,count);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalDraw(d,t,first,count);}CaptureRetained(d);float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);return originalDraw(d,t,first,count);}
-HRESULT __stdcall Indexed(void* d,D3DPRIMITIVETYPE t,UINT min,UINT n,UINT start,UINT count){if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalIndexed(d,t,min,n,start,count);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalIndexed(d,t,min,n,start,count);}CaptureRetained(d);float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);return originalIndexed(d,t,min,n,start,count);}
-HRESULT __stdcall DrawUP(void* d,D3DPRIMITIVETYPE t,UINT count,const void* vertices,UINT stride){if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalDrawUP(d,t,count,vertices,stride);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalDrawUP(d,t,count,vertices,stride);}float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);return originalDrawUP(d,t,count,vertices,stride);}
-HRESULT __stdcall IndexedUP(void* d,D3DPRIMITIVETYPE t,UINT min,UINT n,UINT count,const void* indices,D3DFORMAT format,const void* vertices,UINT stride){if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalIndexedUP(d,t,min,n,count,indices,format,vertices,stride);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalIndexedUP(d,t,min,n,count,indices,format,vertices,stride);}float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);return originalIndexedUP(d,t,min,n,count,indices,format,vertices,stride);}
+HRESULT __stdcall Draw(void* d,D3DPRIMITIVETYPE t,UINT first,UINT count){if(enemy_shadows::probing)return D3D_OK;if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalDraw(d,t,first,count);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalDraw(d,t,first,count);}CaptureRetained(d);float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);if(auto plan=ReceiverPlan(d,t,false,0,0,first,count))return wall_shadows::Submit(d,*plan,false,0,0,originalIndexed);return originalDraw(d,t,first,count);}
+HRESULT __stdcall Indexed(void* d,D3DPRIMITIVETYPE t,UINT min,UINT n,UINT start,UINT count){if(enemy_shadows::probing)return D3D_OK;if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalIndexed(d,t,min,n,start,count);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalIndexed(d,t,min,n,start,count);}CaptureRetained(d);float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);if(auto plan=ReceiverPlan(d,t,true,min,n,start,count))return wall_shadows::Submit(d,*plan,true,min,n,originalIndexed);return originalIndexed(d,t,min,n,start,count);}
+HRESULT __stdcall DrawUP(void* d,D3DPRIMITIVETYPE t,UINT count,const void* vertices,UINT stride){if(enemy_shadows::probing)return D3D_OK;if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalDrawUP(d,t,count,vertices,stride);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalDrawUP(d,t,count,vertices,stride);}float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);return originalDrawUP(d,t,count,vertices,stride);}
+HRESULT __stdcall IndexedUP(void* d,D3DPRIMITIVETYPE t,UINT min,UINT n,UINT count,const void* indices,D3DFORMAT format,const void* vertices,UINT stride){if(enemy_shadows::probing)return D3D_OK;if(self_shadows::pass){if(!self_shadows::EligibleDraw(d))return D3D_OK;self_shadows::DrawState state(d);return originalIndexedUP(d,t,min,n,count,indices,format,vertices,stride);}enemy_shadows::ObserveDraw(d);if(enemy_shadows::drawing){enemy_shadows::DrawScope scope(d);return originalIndexedUP(d,t,min,n,count,indices,format,vertices,stride);}float alpha=NativeOpacity(d);if(alpha<=0)return D3D_OK;NativeFade fade(d,alpha);NativeReplacement replacement(d);Samplers scoped(d);return originalIndexedUP(d,t,min,n,count,indices,format,vertices,stride);}
 bool IsNativeHexDraw(){
 #ifndef VIDEO_TEST
     if(!ui::drawing&&rootVisible&&GetTickCount64()-lastMenu<200&&art::hex.texture){

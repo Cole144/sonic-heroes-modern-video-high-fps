@@ -19,9 +19,7 @@ void __cdecl ProbeOverlay(void*,const Stats* stats){Check(!capturing&&stats->siz
 HRESULT __stdcall ProbePresent(void* d,const RECT* a,const RECT* b,HWND window,const RGNDATA* data){presentTimes.push_back(Now());if(samplePixels)presentPixels.push_back(Pixels());if(stallPresent){stallPresent=false;Sleep(20);}return nativePresent(d,a,b,window,data);}
 void* vb=nullptr;void* ib=nullptr;
 void Fixture(float amount,float hudShift=0){
-    // Timing scenarios start from an unlimited image budget; the limiter's own
-    // behaviour is covered by GovernorTests, not by accumulated test hitches.
-    ++updates;governor=ImageGovernor{};PrepareLayoutHistory();current=Frame{};current.epoch=epoch;capturing=true;hudPhase=false;
+    ++updates;PrepareLayoutHistory();current=Frame{};current.epoch=epoch;capturing=true;hudPhase=false;
     Matrix world=Identity(),view=Identity(),proj{};view.m[3][0]=-amount*.2f;
     for(int i=0;i<4;i++)view.m[i][0]=-view.m[i][0]; // Actual RenderWare camera handedness.
     proj.m[0][0]=1;proj.m[1][1]=1;proj.m[2][2]=10.f/9.9f;proj.m[2][3]=1;proj.m[3][2]=-1.f/9.9f;
@@ -352,24 +350,6 @@ void LayoutTests(){
     previous.commands.push_back(std::make_unique<Command>(*previous.commands[0]));PrepareLayoutHistory();Check(!PriorLayout(previous.commands[0]->layoutKey),"ambiguous topology keys never reuse an arbitrary draw");
     ClearHistory();Check(layoutHistory.empty(),"history reset removes cached command pointers");
 }
-unsigned upCalls=0;UpFn countedDriverUp=nullptr;IndexedUpFn countedDriverIndexedUp=nullptr;
-HRESULT __stdcall CountDriverUp(void* d,D3DPRIMITIVETYPE p,UINT n,const void* v,UINT s){++upCalls;return countedDriverUp(d,p,n,v,s);}
-HRESULT __stdcall CountDriverIndexedUp(void* d,D3DPRIMITIVETYPE p,UINT a,UINT b,UINT c,const void* i,D3DFORMAT f,const void* v,UINT s){++upCalls;return countedDriverIndexedUp(d,p,a,b,c,i,f,v,s);}
-void GovernorTests(){
-    ImageGovernor g;Check(g.limit==ImageGovernor::Unlimited,"image limiter starts unlimited");
-    g.Observe(true,3,3);g.Observe(true,3,3);Check(g.limit==ImageGovernor::Unlimited,"two overloaded ticks (a hitch) do not shed images");
-    g.Observe(true,3,3);Check(g.limit==2,"sustained overload sheds one interpolated image");
-    for(int i=0;i<119;i++)g.Observe(false,2,3);Check(g.limit==2,"shed level holds through the calm period");
-    g.Observe(false,2,3);Check(g.limit==3,"calm period restores one image");g.Observe(false,3,3);Check(g.limit==ImageGovernor::Unlimited,"reaching the requested rate clears the limit");
-    for(int i=0;i<3;i++)g.Observe(true,3,3);Check(g.limit==2&&g.patience==240,"overload soon after restoring doubles the calm period");
-    ImageGovernor u;for(int i=0;i<3;i++)u.Observe(true,20,ImageGovernor::Unlocked);Check(u.limit==15,"unlocked FPS sheds proportionally");
-    ImageGovernor z;for(int i=0;i<3;i++)z.Observe(true,1,1);Check(z.limit==0,"overloaded single image sheds to native-only");for(int i=0;i<120;i++)z.Observe(false,0,1);Check(z.limit==1,"native-only limit retries interpolation after the calm period");
-    // The limit caps a real presentation: 180 FPS held to one in-between image.
-    ClearHistory();nativePresent=oldPresent;oldPresent=&ProbePresent;settings.targetHz=180;
-    Fixture(0);previous=std::move(current);Fixture(1);governor.limit=1;previous.time=Now();tickStart=Now();clockValid=true;capturing=true;warmup=0;replayCost=.00005;presentTimes.clear();
-    Check(SUCCEEDED(Present(device,nullptr,nullptr,nullptr,nullptr))&&presentTimes.size()==2&&(timing::frame.reasons&timing::Governed),"image limit caps in-between images in a real presentation");Wait();
-    oldPresent=nativePresent;settings.targetHz=120;governor=ImageGovernor{};ClearHistory();
-}
 // Cloned instances (each teammate's jump ball) share one key.
 void DuplicatePairingTests(){
     auto frame=[](std::initializer_list<float> xs,uint64_t key=0x5a11){Frame f;for(float x:xs){auto c=std::make_unique<Command>();c->kind=Command::Draw;c->scene3d=true;c->key=key;c->layout=7;c->stride=sizeof(Vertex);c->fvf=Fvf;c->vertices=1;
@@ -407,105 +387,6 @@ void DuplicateMotionTests(){
     replaying=true;Check(Replay(current,&matches,.5f,&plan),"replay paired clones");uint64_t replayed=Pixels();
     Check(replayed!=first&&replayed!=last&&replayed==midpoint,"paired clones render exactly where the native midpoint draws them");
     Check(Replay(current,nullptr,1)&&Pixels()==last,"paired clones restore the native current frame");replaying=false;ClearHistory();
-}
-void GeometryCacheTests(){
-    ClearHistory();void* stageVb=nullptr;void* stageIndices=nullptr;
-    Check(SUCCEEDED(D8<23>(device,UINT(sizeof(Vertex)*4),DWORD(D3DUSAGE_WRITEONLY),Fvf,D3DPOOL_MANAGED,&stageVb)),"create static stage vertex buffer");
-    Check(SUCCEEDED(D8<24>(device,UINT(12),DWORD(D3DUSAGE_WRITEONLY),DWORD(D3DFMT_INDEX16),D3DPOOL_MANAGED,&stageIndices)),"create static stage index buffer");
-    auto fill=[&](DWORD color){Vertex quad[4]={{-.8f,-.8f,3,0,0,-1,color},{.8f,-.8f,3,0,0,-1,color},{-.8f,.8f,3,0,0,-1,color},{.8f,.8f,3,0,0,-1,color}};BYTE* p=nullptr;D8<11>(stageVb,UINT(0),UINT(0),&p,DWORD(0));memcpy(p,quad,sizeof(quad));D8<12>(stageVb);};
-    fill(0xff2080ff);uint16_t idx[6]={0,1,2,2,1,3};BYTE* p=nullptr;D8<11>(stageIndices,UINT(0),UINT(0),&p,DWORD(0));memcpy(p,idx,sizeof(idx));D8<12>(stageIndices);
-    auto frame=[&](float amount,int copies){current=Frame{};current.epoch=epoch;capturing=true;hudPhase=false;
-        Matrix world=Identity(),view=Identity(),proj{};view.m[3][0]=-amount*.2f;for(int i=0;i<4;i++)view.m[i][0]=-view.m[i][0];
-        proj.m[0][0]=1;proj.m[1][1]=1;proj.m[2][2]=10.f/9.9f;proj.m[2][3]=1;proj.m[3][2]=-1.f/9.9f;
-        D8<37>(device,D3DTS_WORLD,&world);D8<37>(device,D3DTS_VIEW,&view);D8<37>(device,D3DTS_PROJECTION,&proj);
-        D8<50>(device,D3DRS_LIGHTING,DWORD(FALSE));D8<50>(device,D3DRS_CULLMODE,DWORD(D3DCULL_NONE));D8<50>(device,D3DRS_ZENABLE,DWORD(D3DZB_TRUE));D8<50>(device,D3DRS_ALPHABLENDENABLE,DWORD(FALSE));
-        D8<61>(device,DWORD(0),static_cast<void*>(nullptr));D8<63>(device,DWORD(0),DWORD(D3DTSS_COLOROP),DWORD(D3DTOP_SELECTARG1));D8<63>(device,DWORD(0),DWORD(D3DTSS_COLORARG1),DWORD(D3DTA_DIFFUSE));D8<76>(device,Fvf);
-        D8<36>(device,DWORD(0),static_cast<const D3DRECT*>(nullptr),DWORD(D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER),DWORD(0xff101010),1.f,DWORD(0));D8<34>(device);
-        D8<83>(device,UINT(0),stageVb,UINT(sizeof(Vertex)));D8<85>(device,stageIndices,UINT(0));
-        for(int i=0;i<copies;i++)D8<71>(device,D3DPT_TRIANGLELIST,UINT(0),UINT(4),UINT(0),UINT(2));D8<35>(device);capturing=false;};
-    frame(0,1);previous=std::move(current);frame(1,1);uint64_t native=Pixels();
-    Check(current.valid&&current.commands.size()==2&&current.commands[1]->fromBuffer,"static buffer draw is captured as buffer geometry");
-    auto matches=Match(previous);auto plan=PlanReplay(current,matches);
-    Check(plan.draws[1].prior&&plan.draws[1].unchanged,"unchanged stage geometry matches its previous frame");
-    Check(PrepareGeometry(current,plan)==1&&current.commands[1]->geometry&&current.commands[1]->geometry->ib,"unchanged geometry receives a GPU copy");
-    countedDriverUp=driverUp;countedDriverIndexedUp=driverIndexedUp;driverUp=&CountDriverUp;driverIndexedUp=&CountDriverIndexedUp;upCalls=0;
-    D8<83>(device,UINT(0),vb,UINT(sizeof(Vertex)));D8<85>(device,ib,UINT(1));
-    replaying=true;Check(Replay(current,&matches,.5f,&plan)&&upCalls==0,"interpolated image draws cached geometry without re-sending vertices");
-    Check(Pixels()!=native,"camera motion still moves cached geometry");
-    Check(Replay(current,nullptr,1)&&upCalls==0&&Pixels()==native,"cached native replay is pixel identical to the native frame");replaying=false;
-    void* stream=nullptr;UINT stride=0,base=0;void* indices=nullptr;D8<84>(device,UINT(0),&stream,&stride);D8<86>(device,&indices,&base);
-    Check(stream==vb&&stride==sizeof(Vertex)&&indices==ib&&base==1,"replay restores the game's stream source and index buffer");Release(stream);Release(indices);
-    auto shared=current.commands[1]->geometry;Recycle(previous);previous=std::move(current);frame(2,1);matches=Match(previous);plan=PlanReplay(current,matches);PrepareGeometry(current,plan);
-    Check(current.commands[1]->geometry==shared,"next frame reuses the same GPU geometry without another upload");shared.reset();
-    Recycle(previous);previous=std::move(current);fill(0xffff8020);frame(3,1);uint64_t recolored=Pixels();matches=Match(previous);plan=PlanReplay(current,matches);PrepareGeometry(current,plan);
-    Check(!current.commands[1]->geometry,"changed buffer contents never use stale GPU geometry");
-    upCalls=0;replaying=true;Check(Replay(current,nullptr,1)&&upCalls==1&&Pixels()==recolored,"changed geometry replays its new bytes immediately");replaying=false;
-    // Repeated identical objects (ambiguous for motion matching) cache after
-    // being seen unchanged on two consecutive frames, sharing one GPU copy.
-    ClearHistory();frame(0,3);previous=std::move(current);frame(1,3);matches=Match(previous);plan=PlanReplay(current,matches);
-    Check(!plan.draws[1].prior&&PrepareGeometry(current,plan)==0,"unmatched duplicates are not cached on first sight");
-    Recycle(previous);previous=std::move(current);frame(2,3);uint64_t repeated=Pixels();matches=Match(previous);plan=PlanReplay(current,matches);
-    Check(PrepareGeometry(current,plan)==3&&current.commands[1]->geometry==current.commands[2]->geometry&&current.commands[2]->geometry==current.commands[3]->geometry&&geometryCache.size()==1,"stable duplicates share one GPU copy");
-    upCalls=0;replaying=true;Check(Replay(current,nullptr,1)&&upCalls==0&&Pixels()==repeated,"shared duplicate geometry is pixel identical");replaying=false;
-    driverUp=countedDriverUp;driverIndexedUp=countedDriverIndexedUp;
-    ClearHistory();Check(geometryCache.empty()&&geometryBytes==0,"history reset releases all cached GPU geometry");
-    D8<83>(device,UINT(0),static_cast<void*>(nullptr),UINT(0));D8<85>(device,static_cast<void*>(nullptr),UINT(0));Release(stageVb);Release(stageIndices);
-}
-HRESULT __stdcall StubDraw(void*,D3DPRIMITIVETYPE,UINT,UINT){return D3D_OK;}
-HRESULT __stdcall StubIndexed(void*,D3DPRIMITIVETYPE,UINT,UINT,UINT,UINT){return D3D_OK;}
-HRESULT __stdcall StubUp(void*,D3DPRIMITIVETYPE,UINT,const void*,UINT){return D3D_OK;}
-HRESULT __stdcall StubIndexedUp(void*,D3DPRIMITIVETYPE,UINT,UINT,UINT,const void*,D3DFORMAT,const void*,UINT){return D3D_OK;}
-void CachedReplayBench(){
-    // Remove the allocation-counting wrapper first: it forces a full state
-    // resync on every draw and is not part of the installed hook chain.
-    void* create=reinterpret_cast<void*>(&pipeline::CreateBlock);Write(*static_cast<void***>(device)+57,&create,4);
-    // About 2.75 MB of geometry per image, close to the 2.9 MB measured in
-    // gameplay. Each draw has its own world matrix and alternating blend state.
-    auto clone=[](const Command& c){auto p=std::make_unique<Command>(c);Ref(p->target);Ref(p->depth);Ref(p->source);for(auto t:p->gpu.textures)Ref(t);return p;};
-    Frame f;f.commands.push_back(clone(*current.commands[0]));
-    for(int i=0;i<512;i++){auto c=clone(*current.commands[2]);auto data=c->data;c->data.clear();for(int j=0;j<64;j++)c->data.insert(c->data.end(),data.begin(),data.end());c->vertices*=64;c->count*=64;c->fromBuffer=true;
-        c->world.m[3][0]=float(i%7)*.01f;c->gpu.transforms[0]=c->world;c->gpu.rs[D3DRS_ALPHABLENDENABLE]=i&1;c->gpu.hasRs[D3DRS_ALPHABLENDENABLE]=true;f.commands.push_back(std::move(c));}
-    auto time=[&](){std::vector<double> t;bool ok=true;replaying=true;for(int i=0;i<40;i++){double start=Now();ok=Replay(f,nullptr,1)&&ok;t.push_back((Now()-start)*1000);}replaying=false;Check(ok,"benchmark replay succeeds");std::sort(t.begin(),t.end());return t[20];};
-    double immediate=time();uint64_t immediatePixels=Pixels();
-    for(size_t i=1;i<f.commands.size();i++)f.commands[i]->geometry=UploadGeometry(*f.commands[i]);
-    double cached=time();Check(Pixels()==immediatePixels,"cached benchmark frame is pixel identical to immediate submission");
-    std::vector<double> t;for(int i=0;i<40;i++){double start=Now();{Restore r;r.Capture();}t.push_back((Now()-start)*1000);}std::sort(t.begin(),t.end());double restore=t[20];
-    auto saved=std::make_tuple(driverDraw,driverIndexed,driverUp,driverIndexedUp);driverDraw=&StubDraw;driverIndexed=&StubIndexed;driverUp=&StubUp;driverIndexedUp=&StubIndexedUp;
-    double ours=time();std::tie(driverDraw,driverIndexed,driverUp,driverIndexedUp)=saved;
-    std::cout<<"Replay CPU time, 512 draws / 2.75 MB: immediate p50 "<<immediate<<" ms; cached p50 "<<cached<<" ms (synthetic).\n";
-    std::cout<<"Cached replay breakdown: state save/restore "<<restore<<" ms; per-draw state setup "<<ours-restore<<" ms; driver draws "<<cached-ours<<" ms.\n";
-}
-void CaptureBench(){
-    // 480 static indexed draws of 200 vertices each from one 2.7 MB buffer:
-    // the per-frame capture work that runs during the game's own frame.
-    constexpr UINT Draws=480,Each=200;void* big=nullptr;void* shared=nullptr;
-    Check(SUCCEEDED(D8<23>(device,UINT(Draws*Each*sizeof(Vertex)),DWORD(D3DUSAGE_WRITEONLY),Fvf,D3DPOOL_MANAGED,&big)),"create large static benchmark buffer");
-    Check(SUCCEEDED(D8<24>(device,UINT(Each*3*2),DWORD(D3DUSAGE_WRITEONLY),DWORD(D3DFMT_INDEX16),D3DPOOL_MANAGED,&shared)),"create shared benchmark indices");
-    BYTE* p=nullptr;D8<11>(big,UINT(0),UINT(0),&p,DWORD(0));for(UINT i=0;i<Draws*Each;i++){Vertex v{float(i%Each)*.001f-.1f,float(i/Each)*.0002f,2,0,0,-1,0xff808080};memcpy(p+i*sizeof(Vertex),&v,sizeof(v));}D8<12>(big);
-    D8<11>(shared,UINT(0),UINT(0),&p,DWORD(0));for(UINT i=0;i<Each*3;i++){uint16_t n=uint16_t((i/3+i%3)%Each);memcpy(p+i*2,&n,2);}D8<12>(shared);
-    D8<76>(device,Fvf);D8<83>(device,UINT(0),big,UINT(sizeof(Vertex)));
-    auto run=[&](bool capture){Recycle(current);current.epoch=epoch;capturing=capture;hudPhase=false;double start=Now();D8<34>(device);
-        for(UINT i=0;i<Draws;i++){D8<85>(device,shared,UINT(i*Each));D8<71>(device,D3DPT_TRIANGLELIST,UINT(0),Each,UINT(0),Each);}
-        D8<35>(device);double t=(Now()-start)*1000;capturing=false;return t;};
-    // Unmatched: no unique previous draw (repeated objects), full identity hash.
-    // Matched: previous frame holds the same draws, exact comparison path.
-    std::vector<double> plain,unmatched,matched,state;run(false);run(true);
-    for(int i=0;i<20;i++){plain.push_back(run(false));Recycle(previous);PrepareLayoutHistory();timing::enabled=true;timing::frame={};unmatched.push_back(run(true));state.push_back(timing::frame.phase[timing::State]);timing::enabled=false;
-        Recycle(previous);previous=std::move(current);current=Frame{};PrepareLayoutHistory();matched.push_back(run(true));layoutHistory.clear();}
-    Check(current.valid&&current.commands.size()==Draws,"capture benchmark records every draw");
-    for(auto* v:{&plain,&unmatched,&matched,&state})std::sort(v->begin(),v->end());
-    std::cout<<"Capture overhead, 480 draws / 2.7 MB: unmatched "<<unmatched[10]-plain[10]<<" ms, matched "<<matched[10]-plain[10]<<" ms per frame (state queries "<<state[10]<<" ms) (synthetic).\n";
-#ifdef PROFILE_CAPTURE
-    {auto sample=[&](const char* name,auto fn){double s=Now();for(UINT i=0;i<Draws;i++)fn(i);std::cout<<"  "<<name<<" "<<(Now()-s)*1000<<" ms\n";};
-        auto& vbShadow=shadows.at(big);auto& ibShadow=shadows.at(shared);std::vector<uint8_t> tmp;
-        sample("vertex read",[&](UINT i){vbShadow.Read(size_t(i)*Each*sizeof(Vertex),Each*sizeof(Vertex),tmp);});
-        sample("index read+rebase",[&](UINT){ibShadow.Read(0,Each*6,tmp);RebaseIndices<uint16_t>(tmp,0,Each);});
-        sample("stream/index/desc queries",[&](UINT){void* v=nullptr;UINT s=0,b=0;void* ix=nullptr;BufferDesc8 desc{};D8<84>(device,UINT(0),&v,&s);D8<86>(device,&ix,&b);D8<13>(ix,&desc);Release(v);Release(ix);});
-        sample("finalize",[&](UINT i){auto& c=*current.commands[i];current.bytes=0;Finalize(c,i,0,true);});
-        sample("acquire/recycle",[&](UINT){auto c=Acquire();commandPool.push_back(std::move(c));});
-        sample("state",[&](UINT){auto c=Acquire();State(*c);commandPool.push_back(std::move(c));});}
-#endif
-    current=Frame{};previous=Frame{};D8<83>(device,UINT(0),static_cast<void*>(nullptr),UINT(0));D8<85>(device,static_cast<void*>(nullptr),UINT(0));Release(big);Release(shared);
 }
 void HeavyReplayBench(){
     // Remove the allocation-counting wrapper: it deliberately forces driver
@@ -556,14 +437,7 @@ void GameCodeTests(){
     exe.resize(0x200000);Check(!game_code::SupportedFile(exe),"truncated executable is rejected");
 }
 int main(){SetUnhandledExceptionFilter(&TestException);
-    GameCodeTests();LoggingTests();IndexTests<uint16_t>(1000,64000);IndexTests<uint32_t>(100000,500000);
-    {auto make=[](std::initializer_list<uint16_t> v){std::vector<uint8_t> b(v.size()*2);size_t i=0;for(auto x:v){memcpy(b.data()+i,&x,2);i+=2;}return b;};
-        auto lane=[&](uint16_t bad){std::vector<uint16_t> v(24,uint16_t(500));v[13]=bad;std::vector<uint8_t> b(48);memcpy(b.data(),v.data(),48);return b;};
-        auto b=lane(499);Check(!RebaseIndices<uint16_t>(b,500,10),"vector rebase rejects an index one below min inside a lane");
-        b=lane(510);Check(!RebaseIndices<uint16_t>(b,500,10),"vector rebase rejects an index equal to min+vertices inside a lane");
-        b=lane(509);Check(RebaseIndices<uint16_t>(b,500,10)&&b[26]==9&&b[0]==0,"vector rebase accepts the last valid index");
-        b=make({65535,65534,65533,65532,65531,65530,65529,65528,65535});Check(RebaseIndices<uint16_t>(b,65520,16)&&b[0]==15,"rebase near the 16-bit limit uses the exact scalar path");
-        b=make({1,2,3,4,5,6,7,8,9});Check(!RebaseIndices<uint16_t>(b,65530,100)&&!RebaseIndices<uint16_t>(b=make({0}),1,0),"wrapping and empty ranges are rejected");}StreamingCopyTests();VertexMathTests();LayoutTests();TimerTests();
+    GameCodeTests();LoggingTests();IndexTests<uint16_t>(1000,64000);IndexTests<uint32_t>(100000,500000);StreamingCopyTests();VertexMathTests();LayoutTests();TimerTests();
     FrameRates meter;for(int i=0;i<=180;i++)meter.Presented(double(i)/180,i%3==0);
     Check(std::abs(meter.output.At(1)-180)<2.1f&&std::abs(meter.base.At(1)-60)<2.1f,"FPS meter distinguishes 180 submissions from 60 native frames");
     meter.Presented(2,true);Check(meter.output.At(2)<5&&meter.Peak(2)>=999,"one-second stall lowers measured FPS and retains the frame gap");for(int i=1;i<=90;i++)meter.Presented(2+double(i)/180,i%3==0);Check(meter.Peak(2.5)>=999,"recent hitch remains visible after smooth rendering resumes");
@@ -668,7 +542,7 @@ int main(){SetUnhandledExceptionFilter(&TestException);
     auto menuFixture=[&](float x){current=Frame{};capturing=true;menuFrame=true;hudPhase=false;Matrix unit=Identity();D8<37>(d,D3DTS_WORLD,&unit);D8<37>(d,D3DTS_VIEW,&unit);D8<37>(d,D3DTS_PROJECTION,&unit);D8<50>(d,D3DRS_ZENABLE,DWORD(FALSE));D8<76>(d,Fvf);D8<36>(d,DWORD(0),static_cast<const D3DRECT*>(nullptr),DWORD(D3DCLEAR_TARGET),DWORD(0xff101010),1.f,DWORD(0));D8<34>(d);Vertex triangle[]={{x-.3f,-.3f,.5f,0,0,-1,0xff00ffff},{x+.3f,-.3f,.5f,0,0,-1,0xff00ffff},{x,.3f,.5f,0,0,-1,0xff00ffff}};D8<72>(d,D3DPT_TRIANGLELIST,UINT(1),triangle,UINT(sizeof(Vertex)));D8<35>(d);capturing=false;};
     ClearHistory();menuFixture(-.3f);previous=std::move(current);menuFixture(.3f);uint64_t menuCurrent=Pixels();auto menuMatches=Match(previous);settings.camera=settings.geometry=0;replaying=true;Check(current.commands[1]->canvas&&SupportedMotion(*previous.commands[1],*current.commands[1]),"orthographic menu geometry is eligible independently of gameplay toggles");
     Check(Replay(current,&menuMatches,1.f/3)&&Pixels()!=menuCurrent,"native menu geometry renders a real intermediate image");Check(Replay(current,nullptr,1)&&Pixels()==menuCurrent,"menu replay restores exact native current frame");replaying=false;menuFrame=false;settings.camera=settings.geometry=1;ClearHistory();
-    auto nativeMenu=TexturedMenuTests();Check(TexturedMenuTests(true)==nativeMenu,"deferred textured menu matches independently rendered native pixels");ViewportReplayTests();BufferMirrorTests();auto nativeShader=PixelShaderTests();Check(PixelShaderTests(true)==nativeShader,"deferred pixel-shaded geometry matches independently rendered native pixels");DeferredTests();ActionMenuTests();GameplayPrefixTests();GovernorTests();DuplicatePairingTests();DuplicateMotionTests();GeometryCacheTests();Fixture(1.2f);CachedReplayBench();ClearHistory();CaptureBench();ClearHistory();
+    auto nativeMenu=TexturedMenuTests();Check(TexturedMenuTests(true)==nativeMenu,"deferred textured menu matches independently rendered native pixels");ViewportReplayTests();BufferMirrorTests();auto nativeShader=PixelShaderTests();Check(PixelShaderTests(true)==nativeShader,"deferred pixel-shaded geometry matches independently rendered native pixels");DeferredTests();ActionMenuTests();GameplayPrefixTests();DuplicatePairingTests();DuplicateMotionTests();
     void* texture=nullptr;Check(SUCCEEDED(D8<20>(d,UINT(4),UINT(4),UINT(1),DWORD(0),D3DFMT_A8R8G8B8,D3DPOOL_MANAGED,&texture)),"create mutable effect texture");Check(ObserveTexture(texture),"observe texture write boundary");capturing=true;current.valid=true;D3DLOCKED_RECT texLock{};Check(SUCCEEDED(D8<16>(texture,UINT(0),&texLock,static_cast<const RECT*>(nullptr),DWORD(0))),"native effect texture writes remain permitted");D8<17>(texture,UINT(0));Check(!capturing&&!current.valid&&counters.status==Unsupported,"texture rewritten after an earlier draw rejects replay");Release(texture);
     replaying=false;capturing=false;Release(vb);Release(ib);vb=ib=nullptr;ClearHistory();D8<83>(d,UINT(0),static_cast<void*>(nullptr),UINT(0));D8<85>(d,static_cast<void*>(nullptr),UINT(0));
     Check(SUCCEEDED(D8<14>(d,&pp)),"device Reset releases retained frames and stateblocks");Check(previous.commands.empty()&&current.commands.empty()&&!clockValid,"reset invalidates all interpolation history");

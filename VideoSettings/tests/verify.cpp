@@ -162,6 +162,7 @@ void ShadowCompareTests(){
 }
 #include "enemy_verify.h"
 #include "self_verify.h"
+#include "wall_verify.h"
 int main(){
     Check(StartupProblem(true,0x4060a0,true,true,true)==nullptr,"supported executable with free hook sites starts");
     Check(std::wstring(StartupProblem(false,0,false,false,false)).find(L"different game code")!=std::wstring::npos,"unsupported executable is named as the problem");
@@ -169,7 +170,7 @@ int main(){
     Check(std::wstring(StartupProblem(true,0x4060a0,false,true,true)).find(L"0x658D40")!=std::wstring::npos,"taken display hook is named");
     Check(std::wstring(StartupProblem(true,0x4060a0,true,false,true)).find(L"0x451D65")!=std::wstring::npos,"changed save step is named");
     Check(std::wstring(StartupProblem(true,0x4060a0,true,true,false)).find(L"camera")!=std::wstring::npos,"taken camera hook is named");
-    VerifyEnemyMath();
+    VerifyEnemyMath();VerifyEnemyBlink();VerifyWallShadowMath();
     ShadowCompareTests();
     ShadowModelTests();
     ShadowTests();
@@ -326,7 +327,7 @@ int main(){
     testWindow=CreateWindowExW(0,L"STATIC",L"Video Settings renderer test",WS_OVERLAPPEDWINDOW,0,0,1280,720,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
     testPresent={1280,720,D3DFMT_X8R8G8B8,1,D3DMULTISAMPLE_NONE,D3DSWAPEFFECT_DISCARD,testWindow,TRUE,TRUE,D3DFMT_D16,D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,0,0};
     Check(SUCCEEDED(D8<15>(d3d,UINT(0),D3DDEVTYPE_HAL,testWindow,DWORD(D3DCREATE_SOFTWARE_VERTEXPROCESSING),&testPresent,&testDevice)),"create hidden hardware rendering device");
-    VerifyEnemyGpu();VerifySelfShadows();
+    VerifyEnemyGpu();VerifySelfShadows();VerifyWallShadowGpu();
     {
         void* originalColor=nullptr,*originalDepth=nullptr,*smallColor=nullptr,*largeDepth=nullptr;D3DVIEWPORT9 viewport{};
         D8<32>(testDevice,&originalColor);D8<33>(testDevice,&originalDepth);D8<41>(testDevice,&viewport);

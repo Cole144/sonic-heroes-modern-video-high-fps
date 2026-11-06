@@ -58,3 +58,29 @@ void VerifyEnemyGpu(){
     D8<31>(d,color,oldDepth);D8<54>(d,block);D8<56>(d,block);D8<2>(color);D8<2>(oldDepth);D8<2>(depth);
     submitted=0;drawing=false;projection={};
 }
+// Stand-ins for TObjEnemy::Disp, its blink query and RpClumpRender.
+namespace blink_test {
+inline unsigned char actor[0x200];inline bool hiddenFrame=false;inline unsigned disps=0,renders=0;
+inline int Timer(){int m=0;for(size_t i=0;i<EnemyBlinkTimerCount;i++)m=std::max(m,int(static_cast<signed char>(actor[EnemyBlinkTimers+i])));return m;}
+inline int __fastcall Blink(void*,void*){return Timer();}
+inline int __fastcall Disp(void*,void*){++disps;if(Timer()>0&&hiddenFrame)return 1;EnemyClump(reinterpret_cast<void*>(0x10));EnemyClump(reinterpret_cast<void*>(0x20));return 1;}
+inline void* __cdecl Render(void* clump){++renders;return clump;}
+inline int __fastcall Empty(void*,void*){++disps;return 0;}
+}
+void VerifyEnemyBlink(){
+    using namespace blink_test;
+    auto savedOpaque=originalEnemyOpaque,savedClump=originalEnemyClump;auto savedBlink=enemyBlink;bool savedInstalled=enemy_shadows::installed,savedEnabled=enemy_shadows::enabled,savedSelf=self_shadows::enabled;int savedSelfSetting=current.selfShadows;
+    originalEnemyOpaque=reinterpret_cast<void*>(&blink_test::Disp);originalEnemyClump=reinterpret_cast<void*>(&blink_test::Render);enemyBlink=reinterpret_cast<BlinkFn>(&blink_test::Blink);
+    enemy_shadows::installed=enemy_shadows::enabled=true;self_shadows::enabled=false;current.selfShadows=0;shadow_compare::original=false;
+    auto run=[](){enemy_shadows::BeginFrame();disps=renders=0;EnemyOpaque(actor,nullptr);return enemy_shadows::Find(actor);};
+    memset(actor,0,sizeof(actor));hiddenFrame=false;auto c=run();
+    Check(c&&c->count==2&&disps==1&&renders==2,"visible enemy records its drawn clumps with one draw pass");
+    actor[EnemyBlinkTimers+3]=12;actor[EnemyBlinkTimers+7]=static_cast<unsigned char>(-4);hiddenFrame=true;c=run();
+    Check(c&&c->count==2&&disps==2&&renders==0,"blinking enemy's hidden frame keeps its model silhouette without drawing the model");
+    Check(actor[EnemyBlinkTimers+3]==12&&actor[EnemyBlinkTimers+7]==static_cast<unsigned char>(-4)&&!enemy_shadows::probing,"hit timers are restored after collecting a hidden enemy's clumps");
+    actor[EnemyBlinkTimers+3]=0;actor[EnemyBlinkTimers+7]=0;originalEnemyOpaque=reinterpret_cast<void*>(&blink_test::Empty);
+    c=run();Check(c&&!c->count&&disps==1,"an enemy that draws nothing without blinking is not drawn again");
+    enemy_shadows::enabled=false;self_shadows::enabled=true;actor[EnemyBlinkTimers]=5;originalEnemyOpaque=reinterpret_cast<void*>(&blink_test::Disp);c=run();
+    Check(c&&!c->count&&disps==1,"self shadows alone never re-run a hidden enemy's draw");
+    enemy_shadows::BeginFrame();originalEnemyOpaque=savedOpaque;originalEnemyClump=savedClump;enemyBlink=savedBlink;enemy_shadows::installed=savedInstalled;enemy_shadows::enabled=savedEnabled;self_shadows::enabled=savedSelf;current.selfShadows=savedSelfSetting;
+}
