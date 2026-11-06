@@ -65,5 +65,5 @@ HRESULT __stdcall SetTarget(void* d,void* target,void* depth){
 using FrontFn=HRESULT(__stdcall*)(void*,void*);FrontFn nativeFront=nullptr;
 HRESULT __stdcall FrontBuffer(void* d,void* target){if(!replaying&&!FlushDeferred(timing::BarrierReadback))return D3DERR_INVALIDCALL;return nativeFront(d,target);}
 bool InstallDeferred(void** table){
-    return Slot(table,34,&BeginScene,nativeBegin)&&Slot(table,35,&EndScene,nativeEnd)&&Slot(table,31,&SetTarget,nativeTarget)&&Slot(table,27,&FrontBuffer,nativeFront);
+    return Slot(table,34,&BeginScene,nativeBegin)&&Slot(table,35,&EndScene,nativeEnd)&&Slot(table,31,&SetTarget,nativeTarget)&&Slot(table,30,&FrontBuffer,nativeFront); // 27 is CreateImageSurface
 }
