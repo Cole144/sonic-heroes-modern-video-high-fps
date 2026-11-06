@@ -6,6 +6,10 @@ A [Reloaded-II](https://github.com/Reloaded-Project/Reloaded-II) mod for the PC 
 
 Open **Options** and select the new **TV icon**. The menu works with a mouse, the keyboard, the D-pad or the left stick.
 
+![Options menu with the new Video Setting (TV) icon](images/options-menu.webp)
+
+![Video Setting menu, Display page](images/video-setting-display.webp)
+
 ## Features
 
 ### Display
