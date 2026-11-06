@@ -386,8 +386,20 @@ void TimerTests(){
     Timer(false);Check(!pacingTimer&&!timerActive,"disabling interpolation releases deadline timer and timer-resolution request");
 }
 LONG WINAPI TestException(EXCEPTION_POINTERS* e){std::cerr<<"EXCEPTION "<<std::hex<<e->ExceptionRecord->ExceptionCode<<" at "<<e->ContextRecord->Eip<<" access "<<e->ExceptionRecord->ExceptionInformation[1]<<"\n";for(int i=0;i<24;i++)std::cerr<<reinterpret_cast<DWORD*>(e->ContextRecord->Esp)[i]<<" ";std::cerr<<"\n";return EXCEPTION_EXECUTE_HANDLER;}
+void GameCodeTests(){
+    std::vector<unsigned char> tiny(16,0);Check(!game_code::SupportedFile(tiny),"non-executable data is not a supported game");
+    std::ifstream in(R"(C:\Program Files (x86)\SEGA\SONICHEROES\Tsonic_win.exe)",std::ios::binary);
+    std::vector<unsigned char> exe((std::istreambuf_iterator<char>(in)),{});
+    if(exe.empty()){std::cout<<"SKIP: installed Tsonic_win.exe not found for executable checks\n";return;}
+    Check(game_code::SupportedFile(exe),"supported executable's game code is accepted");
+    uint32_t pe=0;memcpy(&pe,&exe[0x3c],4);
+    auto header=exe;header[pe+22]^=0x20;Check(game_code::SupportedFile(header),"header-only change (4GB patch flag) is still accepted");
+    auto data=exe;data[0x4949b0]^=0xff;Check(game_code::SupportedFile(data),"data-only change (recoloured menu) is still accepted");
+    auto code=exe;code[0x43169]^=0xff;Check(!game_code::SupportedFile(code),"changed game code is rejected");
+    exe.resize(0x200000);Check(!game_code::SupportedFile(exe),"truncated executable is rejected");
+}
 int main(){SetUnhandledExceptionFilter(&TestException);
-    LoggingTests();IndexTests<uint16_t>(1000,64000);IndexTests<uint32_t>(100000,500000);StreamingCopyTests();VertexMathTests();LayoutTests();TimerTests();
+    GameCodeTests();LoggingTests();IndexTests<uint16_t>(1000,64000);IndexTests<uint32_t>(100000,500000);StreamingCopyTests();VertexMathTests();LayoutTests();TimerTests();
     FrameRates meter;for(int i=0;i<=180;i++)meter.Presented(double(i)/180,i%3==0);
     Check(std::abs(meter.output.At(1)-180)<2.1f&&std::abs(meter.base.At(1)-60)<2.1f,"FPS meter distinguishes 180 submissions from 60 native frames");
     meter.Presented(2,true);Check(meter.output.At(2)<5&&meter.Peak(2)>=999,"one-second stall lowers measured FPS and retains the frame gap");for(int i=1;i<=90;i++)meter.Presented(2+double(i)/180,i%3==0);Check(meter.Peak(2.5)>=999,"recent hitch remains visible after smooth rendering resumes");

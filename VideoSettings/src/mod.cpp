@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <tlhelp32.h>
 #include "../../FrameInterpolation/src/api.h"
+#include "../../FrameInterpolation/src/game_code.h"
 
 namespace {
 using namespace video;
@@ -176,11 +177,15 @@ template<class F> bool Slot(void** table,int index,F fn,F& original){
     original=reinterpret_cast<F>(table[index]);void* replacement=reinterpret_cast<void*>(fn);
     return Write(table+index,&replacement,sizeof(replacement));
 }
-bool KnownExecutable(){
-    wchar_t path[MAX_PATH];GetModuleFileNameW(nullptr,path,MAX_PATH);
-    std::ifstream file(path,std::ios::binary);std::vector<unsigned char> data((std::istreambuf_iterator<char>(file)),{});
-    const unsigned char expected[]={0x63,0x16,0x2d,0x4e,0x6b,0xef,0x40,0x7d,0xee,0x30,0xc2,0xdc,0x58,0x40,0x53,0x9a,0xd0,0x13,0x45,0x9c,0xaa,0xe2,0x01,0x9f,0x46,0x34,0x7c,0xe4,0x38,0x9c,0x5b,0x18};
-    unsigned char digest[32];return !data.empty()&&BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,data.data(),ULONG(data.size()),digest,32)>=0&&!memcmp(digest,expected,32);
+bool KnownExecutable(){return game_code::Supported();}
+// Names the first failed startup check, so a report screenshot says why.
+const wchar_t* StartupProblem(bool knownExecutable,uintptr_t optionsExec,bool showHook,bool saveHook,bool cameraHook){
+    if(!knownExecutable)return L"this Tsonic_win.exe has different game code from the supported PC version.";
+    if(optionsExec!=0x4060a0)return L"another mod has already replaced the Options menu (0x74F530).";
+    if(!showHook)return L"another mod has already hooked the display update (0x658D40).";
+    if(!saveHook)return L"another mod has already changed the Options save step (0x451D65).";
+    if(!cameraHook)return L"another mod has already hooked the camera (0x61E4C0).";
+    return nullptr;
 }
 using ShadowInitFn=void(__cdecl*)();ShadowInitFn originalShadowInit=nullptr;
 using LoadClumpsFn=void*(__stdcall*)(void*,const char* const*,int);
@@ -1235,8 +1240,17 @@ extern "C" __declspec(dllexport) void __cdecl ReloadedStart(){
      fpsModule=LoadLibraryW(fps.c_str());
      if(fpsModule)if(auto start=reinterpret_cast<void(__cdecl*)()>(GetProcAddress(fpsModule,"ReloadedStart")))start();}
 #endif
-    if(GetModuleHandleW(nullptr)!=reinterpret_cast<HMODULE>(0x400000)||!KnownExecutable()||Mem<uintptr_t>(0x74f530)!=0x4060a0||memcmp(reinterpret_cast<void*>(0x658d40),"\xa1\x14\x0c\x8e\x00",5)||memcmp(reinterpret_cast<void*>(0x451d65),saveSuccessCall,5)||memcmp(reinterpret_cast<void*>(0x61e4c0),cameraPrologue,sizeof(cameraPrologue))){
-        MessageBoxW(nullptr,L"Video Settings could not load: this executable or menu/render hook is incompatible.",L"Sonic Heroes Video Settings",MB_ICONERROR);return;
+#ifdef MODERN_VIDEO
+    constexpr const wchar_t* title=L"Sonic Heroes: Modern Video and High FPS";
+#else
+    constexpr const wchar_t* title=L"Sonic Heroes Video Settings";
+#endif
+    bool knownExecutable=GetModuleHandleW(nullptr)==reinterpret_cast<HMODULE>(0x400000)&&KnownExecutable();
+    if(auto problem=knownExecutable
+        ?StartupProblem(true,Mem<uintptr_t>(0x74f530),!memcmp(reinterpret_cast<void*>(0x658d40),"\xa1\x14\x0c\x8e\x00",5),!memcmp(reinterpret_cast<void*>(0x451d65),saveSuccessCall,5),!memcmp(reinterpret_cast<void*>(0x61e4c0),cameraPrologue,sizeof(cameraPrologue)))
+        :StartupProblem(false,0,false,false,false)){
+        std::wstring text=std::wstring(title)+L" could not load: "+problem;
+        MessageBoxW(nullptr,text.c_str(),title,MB_ICONERROR);return;
     }
     shadow_quality::compatible=InstallShadowQuality();
     if(shadow_quality::compatible)shadow_quality::compatible=InstallShadowModels();

@@ -163,6 +163,12 @@ void ShadowCompareTests(){
 #include "enemy_verify.h"
 #include "self_verify.h"
 int main(){
+    Check(StartupProblem(true,0x4060a0,true,true,true)==nullptr,"supported executable with free hook sites starts");
+    Check(std::wstring(StartupProblem(false,0,false,false,false)).find(L"different game code")!=std::wstring::npos,"unsupported executable is named as the problem");
+    Check(std::wstring(StartupProblem(true,0x123456,true,true,true)).find(L"Options menu")!=std::wstring::npos,"replaced Options menu is named");
+    Check(std::wstring(StartupProblem(true,0x4060a0,false,true,true)).find(L"0x658D40")!=std::wstring::npos,"taken display hook is named");
+    Check(std::wstring(StartupProblem(true,0x4060a0,true,false,true)).find(L"0x451D65")!=std::wstring::npos,"changed save step is named");
+    Check(std::wstring(StartupProblem(true,0x4060a0,true,true,false)).find(L"camera")!=std::wstring::npos,"taken camera hook is named");
     VerifyEnemyMath();
     ShadowCompareTests();
     ShadowModelTests();

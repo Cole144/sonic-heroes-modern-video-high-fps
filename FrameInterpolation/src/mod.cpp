@@ -11,6 +11,7 @@
 #include <memory>
 #include <array>
 #include "api.h"
+#include "game_code.h"
 #include "math.h"
 #include "rates.h"
 #include "diagnostics.h"
@@ -579,7 +580,7 @@ void* Trampoline(uintptr_t address,const std::vector<uint8_t>& bytes){
     auto p=static_cast<uint8_t*>(VirtualAlloc(nullptr,bytes.size()+5,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE));if(!p)return nullptr;memcpy(p,bytes.data(),bytes.size());p[bytes.size()]=0xe9;*reinterpret_cast<int32_t*>(p+bytes.size()+1)=int32_t(address+bytes.size()-reinterpret_cast<uintptr_t>(p+bytes.size()+5));DWORD old;VirtualProtect(p,bytes.size()+5,PAGE_EXECUTE_READ,&old);FlushInstructionCache(GetCurrentProcess(),p,bytes.size()+5);return p;
 }
 bool Jump(uintptr_t address,void* to,size_t n,uint8_t op=0xe9){std::vector<uint8_t> bytes(n,0x90);bytes[0]=op;*reinterpret_cast<int32_t*>(bytes.data()+1)=int32_t(reinterpret_cast<uintptr_t>(to)-address-5);return Write(reinterpret_cast<void*>(address),bytes.data(),n);}
-bool KnownExe(){wchar_t path[MAX_PATH];GetModuleFileNameW(nullptr,path,MAX_PATH);std::ifstream file(path,std::ios::binary);std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),{});const uint8_t expected[]={0x63,0x16,0x2d,0x4e,0x6b,0xef,0x40,0x7d,0xee,0x30,0xc2,0xdc,0x58,0x40,0x53,0x9a,0xd0,0x13,0x45,0x9c,0xaa,0xe2,0x01,0x9f,0x46,0x34,0x7c,0xe4,0x38,0x9c,0x5b,0x18};uint8_t digest[32];return !bytes.empty()&&BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,bytes.data(),ULONG(bytes.size()),digest,32)>=0&&!memcmp(digest,expected,32);}
+bool KnownExe(){return game_code::Supported();}
 }
 extern "C" __declspec(dllexport) const motion::Api* __cdecl HeroesMotionApi(uint32_t version){return version==motion::Abi&&fi::installed?&fi::api:nullptr;}
 extern "C" __declspec(dllexport) void __cdecl ReloadedStart(){
