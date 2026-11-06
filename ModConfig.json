@@ -1,0 +1,53 @@
+{
+  "ModId": "sonicheroes.graphics.modern-video",
+  "ModName": "Sonic Heroes: Modern Video and High FPS",
+  "ModAuthor": "Ryan",
+  "ModVersion": "0.1.0-beta",
+  "ModDescription": "Beta. An in-game Video menu (Options > TV icon) with display, graphics and shadow settings, plus higher frame rates through frame interpolation while gameplay stays at the original 60 Hz.",
+  "ModNativeDll32": "ModernVideo.dll",
+  "ModNativeDll64": "",
+  "ModDll": "",
+  "CanUnload": false,
+  "HasExports": false,
+  "IsLibrary": false,
+  "IsUniversalMod": false,
+  "SupportedAppId": [
+    "tsonic_win.exe"
+  ],
+  "ModDependencies": [
+    "sonicheroes.guis.widescreenrevamp",
+    "sonicheroes.essentials.graphics"
+  ],
+  "OptionalDependencies": [
+    "sonicheroes.graphics.screen-scale"
+  ],
+  "Tags": [
+    "Graphics",
+    "User Interface"
+  ],
+  "PluginData": {
+    "GitHubDependencies": {
+      "IdToConfigMap": {
+        "sonicheroes.essentials.graphics": {
+          "Config": {
+            "UserName": "Sewer56",
+            "RepositoryName": "Heroes.Graphics.Essentials.ReloadedII",
+            "UseReleaseTag": true,
+            "AssetFileName": "Mod.zip"
+          },
+          "ReleaseMetadataName": "Sewer56.Update.ReleaseMetadata.json"
+        }
+      }
+    },
+    "GameBananaDependencies": {
+      "IdToConfigMap": {
+        "sonicheroes.guis.widescreenrevamp": {
+          "Config": {
+            "ItemType": "Mod",
+            "ItemId": 33976
+          }
+        }
+      }
+    }
+  }
+}
