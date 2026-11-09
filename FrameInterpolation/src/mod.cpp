@@ -187,13 +187,20 @@ std::array<uintptr_t,4> lastTextureMismatch{};
 bool State(Command& c){
     timing::Scope timer(timing::State);
     if(!Targets(c)||!pipeline::Capture(c.gpu))return false;
+    // Only the stages this draw uses are verified and kept: up to the first disabled colour stage, or all 8 with a
+    // pixel shader. The fixed-function pipeline ignores the rest, so they are recorded as empty.
+    DWORD used=8;
+    auto trim=[&](){used=8;if(!c.gpu.ps)for(DWORD i=0;i<8;i++)if(c.gpu.hasTss[i][D3DTSS_COLOROP]&&c.gpu.tss[i][D3DTSS_COLOROP]==D3DTOP_DISABLE){used=i;break;}
+        for(DWORD i=used;i<8;i++)c.gpu.textures[i]=nullptr;};
+    trim();
     for(auto t:c.gpu.textures)Ref(t);
     c.fvf=c.gpu.fvf;c.world=c.gpu.transforms[0];c.view=c.gpu.transforms[1];c.projection=c.gpu.transforms[2];
-    for(DWORD i=0;i<8;i++){void* tex=nullptr;if(SUCCEEDED(D8<60>(device,i,&tex))){if(tex!=c.gpu.textures[i]){
+    for(DWORD i=used;i<8;i++)c.textures[i]=0;
+    for(DWORD i=0;i<used;i++){void* tex=nullptr;if(SUCCEEDED(D8<60>(device,i,&tex))){if(tex!=c.gpu.textures[i]){
             lastTextureMismatch={i,reinterpret_cast<uintptr_t>(c.gpu.textures[i]),reinterpret_cast<uintptr_t>(tex),uintptr_t(current.commands.size())};
             Release(tex);pipeline::dirty=true;timing::frame.reasons|=timing::TextureResync;
             for(auto t:c.gpu.textures)Release(t);c.gpu.textures.fill(nullptr);
-            if(!pipeline::Capture(c.gpu))return false;for(auto t:c.gpu.textures)Ref(t);
+            if(!pipeline::Capture(c.gpu))return false;{DWORD before=used;trim();for(DWORD k=used;k<before;k++)c.textures[k]=0;}for(auto t:c.gpu.textures)Ref(t);
             c.fvf=c.gpu.fvf;c.world=c.gpu.transforms[0];c.view=c.gpu.transforms[1];c.projection=c.gpu.transforms[2];
             tex=nullptr;if(FAILED(D8<60>(device,i,&tex))||tex!=c.gpu.textures[i]){Release(tex);return false;}
         }bool supported=ObserveTexture(tex);void* identity=nullptr;if(tex)D8<0>(tex,&UnknownId,&identity);c.textures[i]=reinterpret_cast<uintptr_t>(identity);Release(identity);Release(tex);if(!supported)return false;}}c.texture=c.textures[0];
