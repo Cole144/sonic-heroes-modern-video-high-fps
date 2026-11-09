@@ -115,7 +115,7 @@ inline void ReadLockedBytes(void* destination,const void* source,size_t size,boo
 }
 // Merge initialized CPU-written spans; never read WRITEONLY buffers back from GPU.
 struct Shadow {
-    uint64_t generation=0;bool dynamic=false;std::vector<uint8_t> bytes;
+    uint64_t generation=0,writes=0;bool dynamic=false;std::vector<uint8_t> bytes; // writes: Unlock count
     std::vector<std::pair<size_t,size_t>> valid;
     uint8_t* locked=nullptr;size_t offset=0,length=0;bool readonly=false,streaming=false;uintptr_t mirrorPage=~uintptr_t(0);
     void MarkWritten(size_t at,size_t size){
@@ -128,7 +128,7 @@ struct Shadow {
         for(auto span:valid)if(at>=span.first&&at+size<=span.second)return true;return false;
     }
     void Write(size_t at,const void* data,size_t size,bool stream=false){
-        if(at>bytes.size()||size>bytes.size()-at)return;ReadLockedBytes(bytes.data()+at,data,size,stream);MarkWritten(at,size);
+        if(at>bytes.size()||size>bytes.size()-at)return;ReadLockedBytes(bytes.data()+at,data,size,stream);MarkWritten(at,size);++writes;
     }
     bool Read(size_t at,size_t size,std::vector<uint8_t>& out)const{
         if(at>bytes.size()||size>bytes.size()-at)return false;
