@@ -214,6 +214,21 @@ template<class Index> bool IndicesInRange(const std::vector<uint8_t>& data,UINT 
     if(data.size()%sizeof(Index))return false;
     for(size_t i=0;i<data.size();i+=sizeof(Index)){Index value;memcpy(&value,data.data()+i,sizeof(value));if(value>=vertices)return false;}return true;
 }
+// Per-vertex UV identity; FVF strides and offsets are multiples of 4 (anything else takes the byte path).
+bool SameStrided(const uint8_t* a,const uint8_t* b,size_t size,size_t stride,size_t uv){
+    if((stride|uv)&3){for(size_t i=0;i<size;i+=stride)if(memcmp(a+i+uv,b+i+uv,stride-uv))return false;return true;}
+    const size_t words=(stride-uv)/4;
+    for(size_t i=0;i<size;i+=stride){const uint32_t* x=reinterpret_cast<const uint32_t*>(a+i+uv);const uint32_t* y=reinterpret_cast<const uint32_t*>(b+i+uv);uint32_t d=0;for(size_t k=0;k<words;k++)d|=x[k]^y[k];if(d)return false;}
+    return true;
+}
+// Layout identity hash; only compared within a session, so it hashes four bytes at a time.
+uint64_t LayoutHash(const uint8_t* data,size_t size,size_t stride,size_t uv){
+    uint64_t h=14695981039346656037ull;if(uv>=stride)return h;
+    if((stride|uv)&3){for(size_t i=0;i<size;i+=stride)h=Hash(data+i+uv,stride-uv,h);return h;}
+    uint32_t lo=0x811C9DC5u,hi=0x9E3779B9u;const size_t words=(stride-uv)/4;
+    for(size_t i=0;i<size;i+=stride){const uint32_t* x=reinterpret_cast<const uint32_t*>(data+i+uv);for(size_t k=0;k<words;k++){lo=(lo^x[k])*0x01000193u;hi=(hi+x[k])*0x85EBCA6Bu;hi^=hi>>13;}}
+    return (uint64_t(hi)<<32)|lo;
+}
 bool Finalize(Command& c,uint64_t resource,UINT offset){
     if(c.stride<12||c.stride>256||!c.vertices||c.data.size()!=size_t(c.vertices)*c.stride)return false;
     if(c.indices.size()){size_t width=c.indexFormat==D3DFMT_INDEX16?2:c.indexFormat==D3DFMT_INDEX32?4:0;if(!width||c.indices.size()!=size_t(VertexCount(c.primitive,c.count))*width)return false;
@@ -228,9 +243,10 @@ bool Finalize(Command& c,uint64_t resource,UINT offset){
     // x86. Animated positions/colors are deliberately outside the UV identity.
     const auto prior=PriorLayout(c.layoutKey);
     bool same=prior&&prior->stride==c.stride&&prior->fvf==c.fvf&&prior->data.size()==c.data.size()&&prior->indices==c.indices;
-    if(same&&uv<c.stride)for(size_t i=0;i<c.data.size();i+=c.stride)if(memcmp(prior->data.data()+i+uv,c.data.data()+i+uv,c.stride-uv)){same=false;break;}
+    // Unchanged geometry compares in one memcmp; otherwise a word loop instead of a memcmp call per vertex.
+    if(same&&uv<c.stride&&memcmp(prior->data.data(),c.data.data(),c.data.size()))same=SameStrided(prior->data.data(),c.data.data(),c.data.size(),c.stride,uv);
     if(same){c.key=prior->key;c.layout=prior->layout;}
-    else {c.key=Hash(c.indices.data(),c.indices.size(),h);h=14695981039346656037ull;if(uv<c.stride)for(size_t i=0;i<c.data.size();i+=c.stride)h=Hash(c.data.data()+i+uv,c.stride-uv,h);c.layout=h;if(menuFrame)c.key=Hash(&c.layout,sizeof(c.layout),c.key);}
+    else {c.key=Hash(c.indices.data(),c.indices.size(),h);c.layout=LayoutHash(c.data.data(),c.data.size(),c.stride,uv);if(menuFrame)c.key=Hash(&c.layout,sizeof(c.layout),c.key);}
     return Room(c.data.size()+c.indices.size()+sizeof(Command)+c.gpu.lights.size()*sizeof(pipeline::Light));
 }
 void CaptureUP(D3DPRIMITIVETYPE p,UINT count,const void* data,UINT stride,UINT min,UINT vertices,const void* indices,D3DFORMAT format){
