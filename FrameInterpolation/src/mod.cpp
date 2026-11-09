@@ -468,13 +468,13 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     {timing::Scope timer(timing::Match);if(history){matches=Match(previous);auto currentKeys=Match(current);for(auto& p:currentKeys)if(!p.second)matches.erase(p.first);plan=PlanReplay(current,matches,&previous);if(!plan.usable){history=false;unmatched=true;timing::frame.reasons|=timing::Unmatched;}}}
     replayCost=std::max(.00005,replayCost*.9);
     timing::frame.warmup=warmup;if(warmup){--warmup;history=false;timing::frame.reasons|=timing::Warming;}
-    unsigned images=divisions?divisions-1:0;double first=tickStart+interval,step=interval;
+    unsigned images=divisions?divisions-1:0;double first=tickStart+interval,step=interval;const double end=tickStart+1.0/60;
     if(history&&clockValid&&!unlocked){
         // Keep the requested slots when the first one is reachable. A late native
         // frame presents its first image as soon as it can be replayed and spaces
         // the rest evenly up to the native image; alpha follows each image's time.
         // Dropping the whole tick to fewer slots made 180 alternate with 120.
-        const double end=tickStart+1.0/60,ready=Now()+replayCost+.0005;first=std::max(first,ready);
+        const double ready=Now()+replayCost+.0005;first=std::max(first,ready);
         while(images&&(end-first)/images<interval*.75)--images;
         if(images)step=(end-first)/images;
         if(images+1<requested){timing::frame.reasons|=timing::PacingReduced;timing::frame.skipped+=requested-1-images;}
@@ -486,7 +486,7 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
         if(unlocked){
             // No presentation-rate cap. Leave time for the authoritative image
             // and never run simulation more than once per native 60 Hz tick.
-            const double end=tickStart+1.0/60;float lastAlpha=0;
+            float lastAlpha=0;
             while(Now()+replayCost*2+.00025<end){
                 float alpha=float(std::clamp((Now()+replayCost-tickStart)*60,0.0,.999));
                 if(alpha<=lastAlpha)break;
@@ -502,7 +502,9 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
             double start=Now();overwritten=true;ok=Replay(current,&matches,float(std::min(.999,(deadline-tickStart)*60)),&plan);
             double cost=Now()-start;replayCost=std::clamp(replayCost*.75+cost*.25,.00005,.02);
             if(!ok)break;
-            if(Now()>deadline+.0005){++timing::frame.skipped;timing::frame.reasons|=timing::LateReplay;continue;}
+            // A finished image that is late is still shown unless the native image is under half a slot away;
+            // dropping it left a gap of two or more slots for work already done.
+            if(Now()>deadline+.0005&&end-Now()<interval*.5){++timing::frame.skipped;timing::frame.reasons|=timing::LateReplay;continue;}
             Until(deadline);lastPresentation=Now();HRESULT extra=Submit(d,nullptr,nullptr,nullptr,nullptr,false);
             if(FAILED(extra)){ok=false;break;}++presented;
         }
