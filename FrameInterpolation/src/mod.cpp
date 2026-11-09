@@ -32,6 +32,9 @@ bool shuttingDown=false;
 void* device=nullptr;bool replaying=false,capturing=false,installed=false,paired=false,deviceReady=false,pacedTick=false;
 uintptr_t skinOwner=0;bool hudPhase=false;uint64_t generation=0,epoch=0;uintptr_t stage=0;
 double tickStart=0;bool clockValid=false;
+// Exclusive fullscreen with V-Sync on: every image of a tick goes straight into the swap chain's FIFO, which shows
+// one per refresh while the game works on the next tick, so a long tick only shows once it outlasts the queue.
+bool queuedTick=false;
 bool timerActive=false,menuFrame=false;unsigned warmup=0;
 HANDLE pacingTimer=nullptr;bool timerAttempted=false;
 double replayCost=.0005;uint64_t context=0;
@@ -463,16 +466,19 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     current.time=Now();current.epoch=epoch;
     bool history=previous.valid&&!previous.commands.empty()&&previous.epoch==epoch&&current.time-previous.time<.05;
     if(!history)timing::frame.reasons|=timing::NoHistory;
-    bool sync=Synchronized();if(sync){counters.status=NeedVsyncOff;history=false;timing::frame.reasons|=timing::Synchronized;}
     const bool unlocked=settings.targetHz==0;
     const unsigned requested=unlocked?0:std::max(1u,settings.targetHz/60);
+    bool sync=Synchronized();bool queued=false;
+    if(sync){const auto& pp=Mem<Present8>(0xaa5140);queued=!pp.windowed&&pp.interval==D3DPRESENT_INTERVAL_ONE&&requested>1;
+        if(!queued){counters.status=NeedVsyncOff;history=false;timing::frame.reasons|=timing::Synchronized;}}
+    queuedTick=queued;
     unsigned divisions=requested;double interval=divisions?1.0/(60*divisions):0;
     bool unmatched=false;Matches matches;ReplayPlan plan;
     {timing::Scope timer(timing::Match);if(history){matches=Match(previous);auto currentKeys=Match(current);for(auto& p:currentKeys)if(!p.second)matches.erase(p.first);plan=PlanReplay(current,matches,&previous);if(!plan.usable){history=false;unmatched=true;timing::frame.reasons|=timing::Unmatched;}}}
     replayCost=std::max(.00005,replayCost*.9);
     timing::frame.warmup=warmup;if(warmup){--warmup;history=false;timing::frame.reasons|=timing::Warming;}
     unsigned images=divisions?divisions-1:0;double first=tickStart+interval,step=interval;const double end=tickStart+1.0/60;
-    if(history&&clockValid&&!unlocked){
+    if(history&&clockValid&&!unlocked&&!queued){
         // Keep the requested slots when the first one is reachable. A late native
         // frame presents its first image as soon as it can be replayed and spaces
         // the rest evenly up to the native image; alpha follows each image's time.
@@ -499,6 +505,14 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
                 if(FAILED(Submit(d,nullptr,nullptr,nullptr,nullptr,false))){ok=false;break;}
                 lastAlpha=alpha;++presented;
             }
+        }else if(queued){
+            // No deadlines: Present waits only while the FIFO is full, and the display paces the images.
+            for(unsigned image=0;image<images;image++){
+                double start=Now();overwritten=true;ok=Replay(current,&matches,float(image+1)/float(divisions),&plan);
+                double cost=Now()-start;replayCost=std::clamp(replayCost*.75+cost*.25,.00005,.02);
+                if(!ok)break;
+                lastPresentation=Now();if(FAILED(Submit(d,nullptr,nullptr,nullptr,nullptr,false))){ok=false;break;}++presented;
+            }
         }else for(unsigned image=0;image<images;image++){
             double deadline=first+image*step;
             if(Now()+replayCost>deadline-.0001||deadline-lastPresentation<interval*.75){++timing::frame.skipped;timing::frame.reasons|=timing::EarlySlotMiss;continue;}
@@ -517,8 +531,8 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     if(needNative){replaying=true;if(!Replay(current,nullptr,1))ok=false;replaying=false;}
     timing::frame.estimateMs=replayCost*1000;if(!ok)timing::frame.reasons|=timing::Failed;
     paired=presented>0&&ok;
-    if(!sync)counters.status=unmatched?Unsupported:paired&&(unlocked||presented+1==requested)?Active:history?TooSlow:Waiting;
-    if(clockValid)Until(tickStart+1.0/60);
+    if(!sync||queued)counters.status=unmatched?Unsupported:paired&&(unlocked||presented+1==requested)?Active:history?TooSlow:Waiting;
+    if(clockValid&&!queued)Until(tickStart+1.0/60);
     HRESULT hr=Submit(d,src,dst,hwnd,dirty,true);
     if(FAILED(hr)){ClearHistory();counters.status=DeviceLost;clockValid=false;}
     else {Recycle(previous);previous=std::move(current);current=Frame{};}
@@ -598,7 +612,7 @@ void __cdecl Wait(){
     // frames, FPS 60 and V-Sync. Retail waits on CRI's PulseEvent (0x6c575e); a
     // pulse sent before the wait begins is lost, doubling that frame. The CRI
     // timer and its sound processing keep running; only this wait is replaced.
-    bool paced=tickStart>0;double boundary=tickStart+1.0/60;
+    bool paced=tickStart>0;double boundary=tickStart+(queuedTick?.995:1.0)/60;
     if(paced){
         Timer(true);Until(boundary);
 #ifndef MOTION_TEST
