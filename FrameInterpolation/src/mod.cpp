@@ -47,6 +47,17 @@ void Timer(bool enable){
 constexpr size_t FrameBudget=96*1024*1024,BufferBudget=128*1024*1024;
 size_t shadowBytes=0;
 double Now(){return timing::Clock();}
+// CRI pins the game thread and its sound threads to CPU 0 ("push 1" before SetThreadAffinityMask at these four
+// sites), the core that takes most interrupt and DPC work. Send them to CPU 2 instead when the PC has one. Runs at
+// mod start, before CRI starts its threads. MMCSS resets the game thread's affinity, so it is set again after.
+DWORD_PTR criMask=0;unsigned affinityTicks=0;
+void MoveCriOffCpu0(){
+    DWORD_PTR process=0,system=0;if(!GetProcessAffinityMask(GetCurrentProcess(),&process,&system)||!(process&4))return;
+    const uintptr_t sites[]={0x6c5215,0x6c5224,0x6c5233,0x6c5241};
+    for(auto at:sites)if(Mem<uint8_t>(at)!=0x6a||Mem<uint8_t>(at+1)!=0x01)return;
+    for(auto at:sites){DWORD old=0;if(VirtualProtect(reinterpret_cast<void*>(at+1),1,PAGE_EXECUTE_READWRITE,&old)){Mem<uint8_t>(at+1)=4;VirtualProtect(reinterpret_cast<void*>(at+1),1,old,&old);}}
+    FlushInstructionCache(GetCurrentProcess(),reinterpret_cast<void*>(0x6c5215),0x40);criMask=4;
+}
 // The game thread joins Windows' multimedia scheduler (MMCSS task "Games"), which raises its current priority above
 // 15 most of the time. Any SetThreadPriority call cancels that boost, so the wait below changes priority only while
 // the thread is not boosted.
@@ -64,6 +75,7 @@ void SetupScheduling(){ // first tick, on the game thread
     for(uintptr_t at:{uintptr_t(0xad2dfc),uintptr_t(0xad2dc8)})if(HANDLE server=Mem<HANDLE>(at))SetThreadPriority(server,THREAD_PRIORITY_TIME_CRITICAL); // CRI's two sound servers
     using AvSetFn=HANDLE(WINAPI*)(LPCWSTR,LPDWORD);
     if(HMODULE avrt=LoadLibraryW(L"avrt.dll"))if(auto set=reinterpret_cast<AvSetFn>(GetProcAddress(avrt,"AvSetMmThreadCharacteristicsW"))){DWORD index=0;mmcssTask=set(L"Games",&index);}
+    if(criMask)SetThreadAffinityMask(self,criMask);
 }
 void Until(double target){
     timing::Scope timer(timing::Wait);
@@ -611,6 +623,7 @@ void __stdcall Hud(void* action){hudPhase=true;oldHud(action);}
 void __cdecl Wait(){
 #ifndef MOTION_TEST
     if(!schedulingReady)SetupScheduling(); // reads CRI's thread handles in the game
+    else if(criMask&&++affinityTicks%600==0)SetThreadAffinityMask(GetCurrentThread(),criMask);
 #endif
 #ifndef MOTION_TEST
     if(installed&&Mem<void*>(0x8e0be8)!=device)InstallDevice(Mem<void*>(0x8e0be8));
@@ -656,6 +669,7 @@ extern "C" __declspec(dllexport) const motion::Api* __cdecl HeroesMotionApi(uint
 extern "C" __declspec(dllexport) void __cdecl ReloadedStart(){
     using namespace fi;static bool started=false;if(started)return;started=true;
     if(GetModuleHandleW(nullptr)!=reinterpret_cast<HMODULE>(0x400000)||!KnownExe()){counters.status=Incompatible;return;}
+    MoveCriOffCpu0();
     const uint8_t call[]={0xe8,0x52,0x1e,0x28,0}; // 443169 -> 6c4fc0
     if(memcmp(reinterpret_cast<void*>(0x443169),call,5)){counters.status=Incompatible;return;}
     const uint8_t menuCall[]={0xe8,0xae,0,0,0}; // 40552d -> 4055e0, EDI object
