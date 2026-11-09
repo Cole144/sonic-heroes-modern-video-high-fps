@@ -51,6 +51,15 @@ double Now(){return timing::Clock();}
 // sites), the core that takes most interrupt and DPC work. Send them to CPU 2 instead when the PC has one. Runs at
 // mod start, before CRI starts its threads. MMCSS resets the game thread's affinity, so it is set again after.
 DWORD_PTR criMask=0;unsigned affinityTicks=0;
+// Windows' text input (IME / text services) hooks the game's PeekMessage and sometimes waits there on another
+// process (17-23 ms in PeekMessageA at 0x446ee2 on the test PC). Sonic Heroes has no text entry. Both calls apply to
+// every thread of the process and only take effect before the window exists, so this runs at mod start.
+void DisableTextInput(){
+    HMODULE imm=GetModuleHandleW(L"imm32.dll");if(!imm)imm=LoadLibraryW(L"imm32.dll");if(!imm)return;
+    using OffFn=BOOL(WINAPI*)(DWORD);
+    if(auto off=reinterpret_cast<OffFn>(GetProcAddress(imm,"ImmDisableTextFrameService")))off(DWORD(-1));
+    if(auto off=reinterpret_cast<OffFn>(GetProcAddress(imm,"ImmDisableIME")))off(DWORD(-1));
+}
 void MoveCriOffCpu0(){
     DWORD_PTR process=0,system=0;if(!GetProcessAffinityMask(GetCurrentProcess(),&process,&system)||!(process&4))return;
     const uintptr_t sites[]={0x6c5215,0x6c5224,0x6c5233,0x6c5241};
@@ -669,7 +678,7 @@ extern "C" __declspec(dllexport) const motion::Api* __cdecl HeroesMotionApi(uint
 extern "C" __declspec(dllexport) void __cdecl ReloadedStart(){
     using namespace fi;static bool started=false;if(started)return;started=true;
     if(GetModuleHandleW(nullptr)!=reinterpret_cast<HMODULE>(0x400000)||!KnownExe()){counters.status=Incompatible;return;}
-    MoveCriOffCpu0();
+    MoveCriOffCpu0();DisableTextInput();
     const uint8_t call[]={0xe8,0x52,0x1e,0x28,0}; // 443169 -> 6c4fc0
     if(memcmp(reinterpret_cast<void*>(0x443169),call,5)){counters.status=Incompatible;return;}
     const uint8_t menuCall[]={0xe8,0xae,0,0,0}; // 40552d -> 4055e0, EDI object
