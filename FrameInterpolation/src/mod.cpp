@@ -157,7 +157,10 @@ void PixelShaderDeleted(DWORD shader){
     if(uses(current))Invalidate(Unsupported,timing::StateRejected);
     pipeline::dirty=true;
 }
-void ClearHistory(){FlushDeferred();deferCandidate=false;timing::Scope timer(timing::Cleanup);layoutHistory.clear();current=Frame{};previous=Frame{};commandPool.clear();pooledBytes=0;texturesRead.clear();if(restoreToken&&device){D8<56>(device,restoreToken);restoreToken=0;}pipeline::dirty=true;++epoch;warmup=3;}
+// Release the D3D references of captured commands and keep their memory pooled; freeing thousands of large
+// vertex blocks at once took 25 ms on the game thread at the goal ring.
+void Park(Frame& f){for(auto& c:f.commands){c->Reuse();size_t n=Storage(*c);if(commandPool.size()<2048&&n<=FrameBudget-pooledBytes){pooledBytes+=n;commandPool.push_back(std::move(c));}}f=Frame{};}
+void ClearHistory(){FlushDeferred();deferCandidate=false;timing::Scope timer(timing::Cleanup);layoutHistory.clear();for(auto& c:commandPool)c->Reuse();Park(current);Park(previous);texturesRead.clear();if(restoreToken&&device){D8<56>(device,restoreToken);restoreToken=0;}pipeline::dirty=true;++epoch;warmup=3;}
 using TextureLockFn=HRESULT(__stdcall*)(void*,UINT,D3DLOCKED_RECT*,const RECT*,DWORD);
 std::unordered_map<void**,TextureLockFn> textureLocks;
 HRESULT __stdcall TextureLock(void* texture,UINT level,D3DLOCKED_RECT* data,const RECT* rect,DWORD flags){
