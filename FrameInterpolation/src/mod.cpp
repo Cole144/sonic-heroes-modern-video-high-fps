@@ -47,15 +47,38 @@ void Timer(bool enable){
 constexpr size_t FrameBudget=96*1024*1024,BufferBudget=128*1024*1024;
 size_t shadowBytes=0;
 double Now(){return timing::Clock();}
+// The game thread joins Windows' multimedia scheduler (MMCSS task "Games"), which raises its current priority above
+// 15 most of the time. Any SetThreadPriority call cancels that boost, so the wait below changes priority only while
+// the thread is not boosted.
+bool schedulingReady=false,restorePending=false;HANDLE mmcssTask=nullptr;int basePriority=THREAD_PRIORITY_NORMAL;
+int CurrentPriority(){
+    using QueryFn=LONG(WINAPI*)(HANDLE,int,void*,ULONG,ULONG*);
+    static auto query=reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryInformationThread"));
+    struct {LONG exitStatus;void* teb;void* process;void* thread;ULONG_PTR affinity;LONG priority;LONG base;} info{}; // THREAD_BASIC_INFORMATION
+    return query&&query(GetCurrentThread(),0,&info,sizeof info,nullptr)>=0?int(info.priority):0;
+}
+bool Boosted(){return mmcssTask&&CurrentPriority()>15;}
+void SetupScheduling(){ // first tick, on the game thread
+    schedulingReady=true;HANDLE self=GetCurrentThread();
+    SetThreadPriority(self,THREAD_PRIORITY_ABOVE_NORMAL);basePriority=THREAD_PRIORITY_ABOVE_NORMAL;
+    for(uintptr_t at:{uintptr_t(0xad2dfc),uintptr_t(0xad2dc8)})if(HANDLE server=Mem<HANDLE>(at))SetThreadPriority(server,THREAD_PRIORITY_TIME_CRITICAL); // CRI's two sound servers
+    using AvSetFn=HANDLE(WINAPI*)(LPCWSTR,LPDWORD);
+    if(HMODULE avrt=LoadLibraryW(L"avrt.dll"))if(auto set=reinterpret_cast<AvSetFn>(GetProcAddress(avrt,"AvSetMmThreadCharacteristicsW"))){DWORD index=0;mmcssTask=set(L"Games",&index);}
+}
 void Until(double target){
     timing::Scope timer(timing::Wait);
     // CRI pins the game thread to CPU 0 and disables its priority boost. At
     // normal priority it wakes behind whatever took CPU 0 while it slept,
     // often a full quantum late. Raise priority only while blocked; the final
     // spin, game and CRI code keep their original priorities.
-    HANDLE self=GetCurrentThread();const int priority=GetThreadPriority(self);
+    // While MMCSS boosts the thread, leave its priority alone (a SetThreadPriority call would cancel the boost); a
+    // restore that fell into a boosted period is done at the next wait.
+    HANDLE self=GetCurrentThread();
+    if(restorePending&&!Boosted()){SetThreadPriority(self,basePriority);restorePending=false;}
+    const int priority=restorePending?basePriority:GetThreadPriority(self);
     const bool raise=priority!=THREAD_PRIORITY_ERROR_RETURN&&priority<THREAD_PRIORITY_TIME_CRITICAL;
-    auto block=[&](auto wait){bool raised=raise&&SetThreadPriority(self,THREAD_PRIORITY_TIME_CRITICAL);bool woke=wait();if(raised)SetThreadPriority(self,priority);return woke;};
+    auto block=[&](auto wait){bool raised=raise&&!Boosted()&&SetThreadPriority(self,THREAD_PRIORITY_TIME_CRITICAL);bool woke=wait();
+        if(raised){if(Boosted())restorePending=true;else SetThreadPriority(self,priority);}return woke;};
     for(;;){double remain=target-Now();if(remain<=0)break;
         // Relative high-resolution timer for the coarse portion; QPC spin for
         // the final half millisecond. Keep a compatible Sleep fallback.
@@ -586,6 +609,9 @@ int __cdecl Skin(void* node,void* params){auto saved=skinOwner;skinOwner=params?
 using HudFn=void(__stdcall*)(void*);HudFn oldHud=nullptr;
 void __stdcall Hud(void* action){hudPhase=true;oldHud(action);}
 void __cdecl Wait(){
+#ifndef MOTION_TEST
+    if(!schedulingReady)SetupScheduling(); // reads CRI's thread handles in the game
+#endif
 #ifndef MOTION_TEST
     if(installed&&Mem<void*>(0x8e0be8)!=device)InstallDevice(Mem<void*>(0x8e0be8));
 #endif
